@@ -12108,6 +12108,8 @@ By default, all memory access methods are enabled in the following order:
 
 This command can be used to change the memory access methods if the default
 behavior is not suitable for a particular target.
+For SBA v1 block reads, OpenOCD batches up to 32 data words when the Debug
+Module supports read-on-data and address autoincrement.
 @end deffn
 
 @deffn {Command} {riscv virt2phys_mode} [@option{hw}|@option{sw}|@option{off}]

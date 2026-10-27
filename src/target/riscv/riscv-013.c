@@ -3459,29 +3459,61 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 	assert(IS_PWR_OF_2(size));
 
 	dm013_info_t *dm = get_dm(target);
-	if (!dm)
+	if (!dm) {
 		return ERROR_FAIL;
+	}
 
 	RISCV013_INFO(info);
 	target_addr_t next_address = address;
 	target_addr_t end_address = address + (increment ? count : 1) * size;
 
-	/* TODO: Reading all the elements in a single batch will boost the
-	 * performance.
-	 */
+	const unsigned int batch_limit = increment == size ? 32U : 1U;
 	while (next_address < end_address) {
 		uint32_t sbcs_write = set_field(0, DM_SBCS_SBREADONADDR, 1);
 		sbcs_write |= sb_sbaccess(size);
-		if (increment == size)
+		if (increment == size) {
 			sbcs_write = set_field(sbcs_write, DM_SBCS_SBAUTOINCREMENT, 1);
-		if (count > 1)
+		}
+		if (count > 1) {
 			sbcs_write = set_field(sbcs_write, DM_SBCS_SBREADONDATA, count > 1);
-		if (dm_write(target, DM_SBCS, sbcs_write) != ERROR_OK)
+		}
+		if (dm_write(target, DM_SBCS, sbcs_write) != ERROR_OK) {
 			return ERROR_FAIL;
+		}
+		if (batch_limit > 1) {
+			/* The DM must support streaming before reads are queued.
+			 * Keep the legacy single-read path otherwise. */
+			uint32_t sbcs_configured;
+			if (read_sbcs_nonbusy(target, &sbcs_configured) != ERROR_OK) {
+				return ERROR_FAIL;
+			}
+			if (!(sbcs_configured & DM_SBCS_SBREADONADDR)) {
+				LOG_TARGET_ERROR(target, "The DM does not support sbreadonaddr");
+				return ERROR_NOT_IMPLEMENTED;
+			}
+			uint32_t streaming_bits = DM_SBCS_SBREADONDATA;
+			if (increment == size) {
+				streaming_bits |= DM_SBCS_SBAUTOINCREMENT;
+			}
+			if (count > 1 && (sbcs_configured & streaming_bits) != streaming_bits) {
+				/* A DM can implement SBA v1 without the requested streaming mode. */
+				for (uint32_t i = 0; i < count; ++i) {
+					struct riscv_mem_access_args single = args;
+					single.address = address + i * increment;
+					single.read_buffer = buffer + i * size;
+					single.count = 1;
+					if (read_memory_bus_v1(target, single) != ERROR_OK) {
+						return ERROR_FAIL;
+					}
+				}
+				return ERROR_OK;
+			}
+		}
 
 		/* This address write will trigger the first read. */
-		if (sb_write_address(target, next_address, RISCV_DELAY_SYSBUS_READ) != ERROR_OK)
+		if (sb_write_address(target, next_address, RISCV_DELAY_SYSBUS_READ) != ERROR_OK) {
 			return ERROR_FAIL;
+		}
 
 		/* First read has been started. Optimistically assume that it has
 		 * completed. */
@@ -3493,17 +3525,25 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 		 * be unnecessary.
 		 */
 		uint32_t sbvalue[4] = {0};
-		for (uint32_t i = (next_address - address) / size; i < count - 1; i++) {
+		for (uint32_t i = (next_address - address) / size; i < count - 1;) {
 			const uint32_t size_in_words = DIV_ROUND_UP(size, 4);
-			struct riscv_batch *batch = riscv_batch_alloc(target, size_in_words);
+			const uint32_t batch_words = MIN(batch_limit, count - 1 - i);
+			struct riscv_batch *batch = riscv_batch_alloc(target,
+					batch_words * size_in_words);
+			if (!batch) {
+				return ERROR_FAIL;
+			}
 			/* Read of sbdata0 must be performed as last because it
 			 * starts the new bus data transfer
 			 * (in case "sbcs.sbreadondata" was set above).
 			 * We don't want to start the next bus read before we
 			 * fetch all the data from the last bus read. */
-			for (uint32_t j = size_in_words - 1; j > 0; --j)
-				riscv_batch_add_dm_read(batch, sbdata[j], RISCV_DELAY_BASE);
-			riscv_batch_add_dm_read(batch, sbdata[0], RISCV_DELAY_SYSBUS_READ);
+			for (uint32_t word = 0; word < batch_words; ++word) {
+				for (uint32_t j = size_in_words - 1; j > 0; --j) {
+					riscv_batch_add_dm_read(batch, sbdata[j], RISCV_DELAY_BASE);
+				}
+				riscv_batch_add_dm_read(batch, sbdata[0], RISCV_DELAY_SYSBUS_READ);
+			}
 
 			int res = batch_run_timeout(target, batch);
 			if (res != ERROR_OK) {
@@ -3511,45 +3551,54 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 				return res;
 			}
 
-			const size_t last_key = batch->read_keys_used - 1;
-			for (size_t k = 0; k <= last_key; ++k) {
-				sbvalue[k] = riscv_batch_get_dmi_read_data(batch, last_key - k);
-				buf_set_u32(buffer + i * size + k * 4, 0, MIN(32, 8 * size), sbvalue[k]);
+			for (uint32_t word = 0; word < batch_words; ++word) {
+				for (uint32_t k = 0; k < size_in_words; ++k) {
+					size_t key = (word + 1) * size_in_words - 1 - k;
+					sbvalue[k] = riscv_batch_get_dmi_read_data(batch, key);
+					buf_set_u32(buffer + (i + word) * size + k * 4,
+							0, MIN(32, 8 * size), sbvalue[k]);
+				}
+				const target_addr_t read_addr = address + (i + word) * increment;
+				log_memory_access(read_addr, sbvalue, size, true);
 			}
 
 			riscv_batch_free(batch);
-			const target_addr_t read_addr = address + i * increment;
-			log_memory_access(read_addr, sbvalue, size, true);
+			i += batch_words;
 		}
 
 		uint32_t sbcs_read = 0;
 		if (count > 1) {
 			/* "Writes to sbcs while sbbusy is high result in undefined behavior.
 			 * A debugger must not write to sbcs until it reads sbbusy as 0." */
-			if (read_sbcs_nonbusy(target, &sbcs_read) != ERROR_OK)
+			if (read_sbcs_nonbusy(target, &sbcs_read) != ERROR_OK) {
 				return ERROR_FAIL;
+			}
 
 			sbcs_write = set_field(sbcs_write, DM_SBCS_SBREADONDATA, 0);
-			if (dm_write(target, DM_SBCS, sbcs_write) != ERROR_OK)
+			if (dm_write(target, DM_SBCS, sbcs_write) != ERROR_OK) {
 				return ERROR_FAIL;
+			}
 		}
 
 		/* Read the last word, after we disabled sbreadondata if necessary. */
 		if (!get_field(sbcs_read, DM_SBCS_SBERROR) &&
 				!get_field(sbcs_read, DM_SBCS_SBBUSYERROR)) {
 			if (read_memory_bus_word(target, address + (count - 1) * increment, size,
-						buffer + (count - 1) * size) != ERROR_OK)
+						buffer + (count - 1) * size) != ERROR_OK) {
 				return ERROR_FAIL;
+			}
 
-			if (read_sbcs_nonbusy(target, &sbcs_read) != ERROR_OK)
+			if (read_sbcs_nonbusy(target, &sbcs_read) != ERROR_OK) {
 				return ERROR_FAIL;
+			}
 		}
 
 		if (get_field(sbcs_read, DM_SBCS_SBBUSYERROR)) {
 			/* We read while the target was busy. Slow down and try again.
 			 * Clear sbbusyerror, as well as readondata or readonaddr. */
-			if (dm_write(target, DM_SBCS, DM_SBCS_SBBUSYERROR) != ERROR_OK)
+			if (dm_write(target, DM_SBCS, DM_SBCS_SBBUSYERROR) != ERROR_OK) {
 				return ERROR_FAIL;
+			}
 
 			if (get_field(sbcs_read, DM_SBCS_SBERROR) == DM_SBCS_SBERROR_NONE) {
 				/* Read the address whose read was last completed. */
@@ -3560,14 +3609,16 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 				 * too early (sbbusyerror became set). */
 				target_addr_t current_address = next_address - (increment ? size : 0);
 				if (read_memory_bus_word(target, current_address, size,
-							buffer + current_address - address) != ERROR_OK)
+							buffer + current_address - address) != ERROR_OK) {
 					return ERROR_FAIL;
+				}
 			}
 
 			int res = riscv_scan_increase_delay(&info->learned_delays,
 					RISCV_DELAY_SYSBUS_READ);
-			if (res != ERROR_OK)
+			if (res != ERROR_OK) {
 				return res;
+			}
 			continue;
 		}
 
@@ -3577,8 +3628,9 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 		} else {
 			/* Some error indicating the bus access failed, but not because of
 			 * something we did wrong. */
-			if (dm_write(target, DM_SBCS, DM_SBCS_SBERROR) != ERROR_OK)
+			if (dm_write(target, DM_SBCS, DM_SBCS_SBERROR) != ERROR_OK) {
 				return ERROR_FAIL;
+			}
 			return ERROR_FAIL;
 		}
 	}

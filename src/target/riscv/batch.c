@@ -317,8 +317,24 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 	if (bscan_tunnel_ir_width != 0) {
 		/* need to right-shift "in" by one bit, because of clock skew between BSCAN TAP and DM TAP */
 		for (size_t i = start_idx; i < batch->used_scans; ++i) {
-			if ((batch->fields + i)->in_value)
+			if ((batch->fields + i)->in_value) {
 				buffer_shr((batch->fields + i)->in_value, DMI_SCAN_BUF_SIZE, 1);
+			}
+		}
+	}
+	for (size_t i = start_idx; i < batch->used_scans; ++i) {
+		const struct scan_field *field = batch->fields + i;
+		if (!field->in_value) {
+			continue;
+		}
+		uint32_t status = buf_get_u32(field->in_value, DTM_DMI_OP_OFFSET,
+				DTM_DMI_OP_LENGTH);
+		if (status != DTM_DMI_OP_SUCCESS && status != DTM_DMI_OP_BUSY) {
+			LOG_TARGET_ERROR(batch->target, "DMI status %u in scan %zu", status, i);
+			if (dtmcs_scan(batch->target->tap, DTM_DTMCS_DMIRESET, NULL) != ERROR_OK) {
+				return ERROR_FAIL;
+			}
+			return ERROR_FAIL;
 		}
 	}
 
