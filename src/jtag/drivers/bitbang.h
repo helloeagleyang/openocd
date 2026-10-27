@@ -61,6 +61,9 @@ struct bitbang_interface {
 
 	/** Force a flush. */
 	int (*flush)(void);
+
+	/** Complete queued scan readbacks together when the adapter can buffer them. */
+	bool defer_scan_readback;
 };
 
 extern const struct swd_driver bitbang_swd;
