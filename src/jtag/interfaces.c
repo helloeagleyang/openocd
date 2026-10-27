@@ -77,6 +77,9 @@ struct adapter_driver *adapter_drivers[] = {
 #if BUILD_EP93XX == 1
 		&ep93xx_adapter_driver,
 #endif
+#if BUILD_HPM_PROBER == 1
+		&hpm_prober_adapter_driver,
+#endif
 #if BUILD_ESP_USB_JTAG == 1
 		&esp_usb_adapter_driver,
 #endif

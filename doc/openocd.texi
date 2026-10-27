@@ -2534,7 +2534,7 @@ If this is not set, the product name is not used during device selection.
 Specifies the @var{serial_string} of the adapter to use.
 If this command is not specified, serial strings are not checked.
 Only the following adapter drivers use the serial string from this command:
-arm-jtag-ew, cmsis_dap, esp_usb_jtag, ft232r, ftdi, hla (stlink, ti-icdi), jlink, kitprog, opendus,
+arm-jtag-ew, cmsis_dap, esp_usb_jtag, ft232r, ftdi, hpm_probex, hla (stlink, ti-icdi), jlink, kitprog, opendus,
 openjtag, osbdm, presto, rlink, st-link, usb_blaster (ublast2), usbprog, vsllink, xds110.
 
 For jlink adapters, the @var{serial_string} is also compared
@@ -2644,6 +2644,76 @@ input instead of driving it to the inactive level, so the reset line needs a
 pull-up. Use @command{reset_config srst_push_pull} if it has none. This GPIO
 emulation is not used for the CH347F dedicated output on pin 8.
 
+@end deffn
+
+@deffn {Interface Driver} {hpm_probex}
+HPM Probe X USB adapter. Its default @option{direct} mode uses the probe's
+high-level RISC-V debug protocol and requires exactly one configured TAP,
+whose ID is checked against the firmware-discovered IDCODE. It supports physical four-wire JTAG and two-wire
+cJTAG OScan1 when the probe firmware supports the selected transport. Use a
+RISC-V target and source @file{interface/hpm-prober.cfg} before the target
+configuration. Select cJTAG before initialization, for example:
+
+@example
+source [find interface/hpm-prober.cfg]
+hpm_probex transport cjtag
+adapter speed 1000
+@end example
+
+@deffn {Config Command} {hpm_probex transport} jtag|cjtag
+Select the physical transport. The default is @option{jtag}.
+@end deffn
+
+@deffn {Config Command} {hpm_probex mode} direct|raw
+Select the OpenOCD access path before @command{init}. The default is
+@option{direct}. Select @option{raw} to force OpenOCD's standard JTAG scans
+over the probe's raw JTAG tunnel, even when high-level firmware features are
+advertised and enabled. With cJTAG selected, the firmware translates these
+logical scans to two-wire OScan1 transfers when the firmware advertises raw
+cJTAG support. OpenOCD uses DAPLink-style JTAG sequences when the firmware
+advertises them, and falls back to the older packed-cycle
+command otherwise. Raw mode buffers readback for scans queued together, so
+several scans can share a USB exchange. For SBA v1 memory reads, this adapter
+also advertises queued DMI readback, allowing OpenOCD to batch up to 32 data
+words per JTAG queue when @command{hpm_probex dmi_batch on} is selected and
+the target DM accepts the required SBA streaming settings. This option
+defaults to @option{off}. The probe does not control physical TRST/SRST pins in
+either mode.
+@end deffn
+
+@deffn {Command} {hpm_probex dmi_batch} on|off
+Allow OpenOCD to group up to 32 SBA v1 read words into each raw JTAG DMI
+queue. The default is @option{off}. The optimized path is used only when
+the target DM accepts @code{sbreadonaddr}, @code{sbreadondata}, and (for
+incrementing reads) @code{sbautoincrement}. Unsupported streaming settings
+use individual address-triggered reads.
+@end deffn
+
+In direct mode, the adapter supports a single directly connected TAP and a
+RISC-V DTM version 1. Raw scans and BSCAN tunneling are unavailable in that
+mode. Configurations requiring physical TRST/SRST pins must use another adapter.
+
+Use @command{adapter serial} to select a probe. Set the adapter speed before
+initialization; changing speed during a session requires restarting OpenOCD.
+The RISC-V memory access order determines which probe-side memory engine may
+be used. For example, @command{riscv mem_access abstract sysbus progbuf}
+prefers the abstract-command engine. Probe-side offload is used only for the
+first selected method when the firmware advertises it and the access meets the
+engine's requirements. Other accesses and older firmware use OpenOCD's DMI
+implementation. A failed offloaded transfer is reported without replaying it,
+since the operation may already have had side effects. Register and
+run-control operations also use DMI transactions.
+
+@deffn {Command} {hpm_probex feature} [sba|progbuf|abstract [on|off]]
+Query or control probe-side memory offload for each method at runtime. All
+three switches default to @option{on}; @option{off} uses OpenOCD's DMI
+implementation for that method. Without arguments, the command lists all
+switches. The displayed firmware status reports the capability advertised by
+the connected probe, not whether the current target supports the method. It
+is @option{unknown} until the probe's capabilities have been queried. These
+switches do not select raw JTAG scans; use @command{hpm_probex mode raw} for
+that purpose.
+@end deffn
 @end deffn
 
 @deffn {Interface Driver} {cklink}

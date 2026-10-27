@@ -240,6 +240,8 @@ struct jtag_interface {
 	 */
 
 	int (*execute_queue)(struct jtag_command *cmd_queue);
+	/* Optional single-TAP discovery for adapters without raw scan support. */
+	int (*read_idcode)(uint32_t *idcode);
 };
 
 /**
@@ -437,6 +439,7 @@ extern struct adapter_driver cmsis_dap_adapter_driver;
 extern struct adapter_driver dmem_dap_adapter_driver;
 extern struct adapter_driver dummy_adapter_driver;
 extern struct adapter_driver ep93xx_adapter_driver;
+extern struct adapter_driver hpm_prober_adapter_driver;
 extern struct adapter_driver esp_usb_adapter_driver;
 extern struct adapter_driver eud_adapter_driver;
 extern struct adapter_driver ft232r_adapter_driver;

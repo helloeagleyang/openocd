@@ -1504,6 +1504,33 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 
 	LOG_DEBUG("Init JTAG chain");
 
+	if (adapter_driver->jtag_ops && adapter_driver->jtag_ops->read_idcode) {
+		/* The probe owns the TAP state machine and reports a real discovered ID.
+		 * Raw scan-chain interrogation is unavailable in the high-level tunnel. */
+		tap = jtag_tap_next_enabled(NULL);
+		if (!tap || jtag_tap_next_enabled(tap)) {
+			LOG_ERROR("Adapter requires exactly one configured TAP");
+			return ERROR_JTAG_INIT_FAILED;
+		}
+		uint32_t id;
+		if (adapter_driver->jtag_ops->read_idcode(&id) != ERROR_OK) {
+			LOG_ERROR("Adapter could not discover the target IDCODE");
+			return ERROR_JTAG_INIT_FAILED;
+		}
+		if (!(id & 1) || id == UINT32_MAX) {
+			LOG_ERROR("Adapter returned an invalid target IDCODE 0x%08" PRIx32, id);
+			return ERROR_JTAG_INIT_FAILED;
+		}
+		tap->has_idcode = true;
+		tap->idcode = id;
+		jtag_examine_chain_display(LOG_LVL_INFO, "tap/device found", tap->dotted_name, id);
+		if (!jtag_examine_chain_match_tap(tap)) {
+			return ERROR_JTAG_INIT_FAILED;
+		}
+		jtag_notify_event(JTAG_TAP_EVENT_SETUP);
+		return ERROR_OK;
+	}
+
 	tap = jtag_tap_next_enabled(NULL);
 	if (!tap) {
 		/* Once JTAG itself is properly set up, and the scan chain
@@ -1525,8 +1552,9 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 
 	jtag_add_tlr();
 	retval = jtag_execute_queue();
-	if (retval != ERROR_OK)
+	if (retval != ERROR_OK) {
 		return retval;
+	}
 
 	/* Examine DR values first.  This discovers problems which will
 	 * prevent communication ... hardware issues like TDO stuck, or
@@ -1567,10 +1595,11 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 		issue_setup = false;
 	}
 
-	if (issue_setup)
+	if (issue_setup) {
 		jtag_notify_event(JTAG_TAP_EVENT_SETUP);
-	else
+	} else {
 		LOG_WARNING("Bypassing JTAG setup events due to errors");
+	}
 
 
 	return ERROR_OK;
