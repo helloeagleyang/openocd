@@ -8,7 +8,8 @@ TESTS += \
 	test-target-configure-cget-command.cfg \
 	test-target-smp-command.cfg \
 	test-riscv-progbuf-multiword.cfg \
-	test-riscv-reset-halt-retry.cfg
+	test-riscv-reset-halt-retry.cfg \
+	test-hpm-reset-halt-fallback.cfg
 endif
 
 EXTRA_DIST = utils.tcl $(TESTS)
