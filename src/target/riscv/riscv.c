@@ -16,6 +16,8 @@
 #include "target/target_type.h"
 #include <target/smp.h>
 #include "jtag/jtag.h"
+#include <jtag/adapter.h>
+#include <jtag/interface.h>
 #include "target/register.h"
 #include "target/breakpoints.h"
 #include "helper/base64.h"
@@ -422,10 +424,14 @@ static int dtmcs_scan_via_bscan(struct jtag_tap *tap, uint32_t out, uint32_t *in
 /* TODO: rename "dtmcontrol"-> "dtmcs" */
 int dtmcs_scan(struct jtag_tap *tap, uint32_t out, uint32_t *in_ptr)
 {
+	if (adapter_driver->riscv_debug_ops && adapter_driver->riscv_debug_ops->dtmcs) {
+		return adapter_driver->riscv_debug_ops->dtmcs(out, in_ptr);
+	}
 	uint8_t value[4];
 
-	if (bscan_tunnel_ir_width != 0)
+	if (bscan_tunnel_ir_width != 0) {
 		return dtmcs_scan_via_bscan(tap, out, in_ptr);
+	}
 
 	buf_set_u32(value, 0, 32, out);
 
@@ -2516,6 +2522,11 @@ static int riscv_examine(struct target *target)
 	}
 	LOG_TARGET_DEBUG(target, "dtmcontrol=0x%" PRIx32, dtmcontrol);
 	uint32_t dtm_version = get_field(dtmcontrol, DTMCONTROL_VERSION);
+	if (adapter_driver->riscv_debug_ops && adapter_driver->riscv_debug_ops->dmi &&
+			(dtm_version != 1 || bscan_tunnel_ir_width != 0)) {
+		LOG_TARGET_ERROR(target, "Direct DMI access requires a RISC-V 0.13 or later DTM without BSCAN tunneling");
+		return ERROR_NOT_IMPLEMENTED;
+	}
 	LOG_TARGET_DEBUG(target, "version=0x%" PRIx32, dtm_version);
 
 	struct target_type *tt;
@@ -3528,13 +3539,16 @@ static int riscv_rw_memory(struct target *target, struct riscv_mem_access_args a
 	struct riscv_info *r = riscv_info(target);
 
 	args.mode = RISCV_MODE_M;
+	args.allow_adapter_offload = true;
 
-	if (riscv_virt2phys_mode_is_off(target))
+	if (riscv_virt2phys_mode_is_off(target)) {
 		return r->access_memory(target, args);
+	}
 
 	enum riscv_priv_mode mode = RISCV_MODE_M;
-	if (riscv_effective_privilege_mode(target, &mode) != ERROR_OK)
+	if (riscv_effective_privilege_mode(target, &mode) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	if (riscv_virt2phys_mode_is_hw(target)) {
 		if (riscv_priv_mode_is_guest(mode)) {
@@ -3550,16 +3564,19 @@ static int riscv_rw_memory(struct target *target, struct riscv_mem_access_args a
 
 	bool mmu_enabled = false;
 	int result = riscv_mmu_impl(target, mode, &mmu_enabled);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
-	if (!mmu_enabled)
+	if (!mmu_enabled) {
 		return r->access_memory(target, args);
+	}
 
 	result = check_virt_memory_access(target, args.address,
 			args.size, args.count, is_write);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
 	uint32_t current_count = 0;
 	target_addr_t current_address = args.address;
@@ -3581,14 +3598,16 @@ static int riscv_rw_memory(struct target *target, struct riscv_mem_access_args a
 		struct riscv_mem_access_args current_access = args;
 		current_access.address = physical_addr;
 		current_access.count = chunk_count;
-		if (is_write)
+		if (is_write) {
 			current_access.write_buffer += current_count * args.size;
-		else
+		} else {
 			current_access.read_buffer += current_count * args.size;
+		}
 
 		result = r->access_memory(target, current_access);
-		if (result != ERROR_OK)
+		if (result != ERROR_OK) {
 			return result;
+		}
 
 		current_count += chunk_count;
 		current_address += chunk_count * args.size;

@@ -33,6 +33,8 @@
 #include "batch.h"
 #include "debug_reg_printer.h"
 #include "field_helpers.h"
+#include <jtag/adapter.h>
+#include <jtag/interface.h>
 
 static int riscv013_on_step_or_resume(struct target *target, bool step);
 static int riscv013_step_or_resume_current_hart(struct target *target,
@@ -64,6 +66,7 @@ static int register_read_direct(struct target *target, riscv_reg_t *value,
 static int register_write_direct(struct target *target, enum gdb_regno number,
 		riscv_reg_t value);
 static int riscv013_access_memory(struct target *target, const struct riscv_mem_access_args args);
+static int riscv013_adapter_has_capability(uint32_t feature);
 static bool riscv013_get_impebreak(const struct target *target);
 static unsigned int riscv013_get_progbufsize(const struct target *target);
 
@@ -412,12 +415,16 @@ static uint32_t set_dmcontrol_hartsel(uint32_t initial, int hart_index)
 
 static void select_dmi(struct jtag_tap *tap)
 {
+	if (adapter_driver->riscv_debug_ops && adapter_driver->riscv_debug_ops->dmi) {
+		return;
+	}
 	if (bscan_tunnel_ir_width != 0) {
 		select_dmi_via_bscan(tap);
 		return;
 	}
-	if (!tap->enabled)
+	if (!tap->enabled) {
 		LOG_ERROR("BUG: Target's TAP '%s' is disabled!", jtag_tap_name(tap));
+	}
 
 	bool need_ir_scan = false;
 	/* FIXME: make "tap" a const pointer. */
@@ -438,8 +445,9 @@ static void select_dmi(struct jtag_tap *tap)
 		}
 	}
 
-	if (need_ir_scan)
+	if (need_ir_scan) {
 		jtag_add_ir_scan(tap, &select_dbus, TAP_IDLE);
+}
 }
 
 static int increase_dmi_busy_delay(struct target *target)
@@ -3644,7 +3652,19 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 	target_addr_t next_address = address;
 	target_addr_t end_address = address + (increment ? count : 1) * size;
 
-	const unsigned int batch_limit = increment == size ? 32U : 1U;
+	/* JTAG adapters can queue DMI scans. A direct DMI callback completes
+	 * each operation immediately, so it does not benefit from batching. */
+	bool batch_reads = !adapter_driver->riscv_debug_ops ||
+			!adapter_driver->riscv_debug_ops->dmi;
+	if (adapter_driver->capabilities && adapter_driver->capabilities->query) {
+		uint32_t supported = 0, enabled = 0;
+		if (adapter_driver->capabilities->query(&supported, &enabled) != ERROR_OK) {
+			batch_reads = false;
+		} else if (supported & ADAPTER_CAP_RISCV_DMI_READ_BATCH) {
+			batch_reads = batch_reads && (enabled & ADAPTER_CAP_RISCV_DMI_READ_BATCH) != 0;
+		}
+	}
+	const unsigned int batch_limit = batch_reads && increment == size ? 32U : 1U;
 	while (next_address < end_address) {
 		uint32_t sbcs_write = set_field(0, DM_SBCS_SBREADONADDR, 1);
 		sbcs_write |= sb_sbaccess(size);
@@ -4783,7 +4803,7 @@ read_memory_progbuf_inner_one(struct target *target, const struct riscv_mem_acce
 /* Do not reconfigure a stream while its last command is still executing.
  * Read back zero before callers access GPRs: an armed trigger could otherwise
  * execute a different command through the same data registers. */
-static int progbuf_multiword_clear_autoexec(struct target *target)
+static int progbuf_clear_autoexec(struct target *target)
 {
 	if (wait_for_idle_if_needed(target) != ERROR_OK)
 		return ERROR_FAIL;
@@ -4890,7 +4910,7 @@ static int progbuf_select_memory_words(struct target *target,
 		const int write_result = dm_write(target, DM_ABSTRACTAUTO, requested);
 		const int read_result = write_result == ERROR_OK ?
 				dm_read(target, &autoexec, DM_ABSTRACTAUTO) : ERROR_FAIL;
-		const int clear_result = progbuf_multiword_clear_autoexec(target);
+		const int clear_result = progbuf_clear_autoexec(target);
 		if (read_result != ERROR_OK || clear_result != ERROR_OK)
 			return ERROR_FAIL;
 		info->progbuf_autoexec_mask = autoexec & requested;
@@ -5046,7 +5066,7 @@ read_memory_progbuf_multiword(struct target *target, const struct riscv_mem_acce
 	result = ERROR_OK;
 cleanup:
 	/* Do not modify abstractauto while the last command may still be busy. */
-	if (progbuf_multiword_clear_autoexec(target) != ERROR_OK)
+	if (progbuf_clear_autoexec(target) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
 	if (result != ERROR_OK && riscv013_clear_abstract_error(target) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
@@ -5182,10 +5202,229 @@ access_memory_abstract(struct target *target, const struct riscv_mem_access_args
 			write_memory_abstract(target, args);
 }
 
+/* Existing adapters may omit capability discovery. */
+static int riscv013_adapter_has_capability(uint32_t feature)
+{
+	uint32_t supported = 0, enabled = 0;
+	if (!adapter_driver->capabilities || !adapter_driver->capabilities->query) {
+		return 0;
+	}
+	if (adapter_driver->capabilities->query(&supported, &enabled) != ERROR_OK) {
+		return ERROR_FAIL;
+	}
+	return (supported & enabled & feature) != 0;
+}
+
+/* Direct operations may change DM selection and leave a command busy on error. */
+static int riscv013_direct_memory(struct target *target, const struct riscv_mem_access_args args,
+	enum riscv_direct_memory_method method)
+{
+	dm013_info_t *dm = get_dm(target);
+	if (!dm) {
+		return ERROR_FAIL;
+	}
+	int result = adapter_driver->riscv_debug_ops->memory(method, args.address, args.size,
+			args.count, args.read_buffer, args.write_buffer);
+	dm->current_hartid = HART_INDEX_UNKNOWN;
+	if (result != ERROR_OK) {
+		dm->abstract_cmd_maybe_busy = true;
+		/* A callback may have completed part of a write. Reserve
+		 * ERROR_NOT_IMPLEMENTED for checks made before dispatch. */
+		if (result == ERROR_NOT_IMPLEMENTED) {
+			return ERROR_FAIL;
+		}
+	}
+	return result;
+}
+
+static int riscv013_direct_select_hart(struct target *target)
+{
+	dm013_info_t *dm = get_dm(target);
+	if (!dm || target->coreid < 0) {
+		return ERROR_FAIL;
+	}
+	int result = adapter_driver->riscv_debug_ops->select_hart(target->coreid);
+	dm->current_hartid = HART_INDEX_UNKNOWN;
+	if (result != ERROR_OK) {
+		dm->abstract_cmd_maybe_busy = true;
+	}
+	return result;
+}
+
+/* The firmware may change the selected hart and overwrite the program buffer.
+ * Use this only at the outer memory boundary, not while OpenOCD is executing
+ * an abstract command or has active program-buffer scratch operations. */
+static int riscv013_direct_progbuf_memory(struct target *target,
+		const struct riscv_mem_access_args args)
+{
+	dm013_info_t *dm = get_dm(target);
+	if (!dm || dm013_select_target(target) != ERROR_OK) {
+		return ERROR_FAIL;
+	}
+
+	riscv_reg_t mstatus = 0, mstatus_old = 0, mstatush = 0, mstatush_old = 0;
+	riscv_reg_t dcsr = 0, dcsr_old = 0;
+	if (modify_privilege_progbuf(target, &mstatus, &mstatus_old, &mstatush,
+			&mstatush_old, &dcsr, &dcsr_old, args.mode) != ERROR_OK) {
+		return ERROR_FAIL;
+	}
+
+	const bool read = riscv_mem_access_is_read(args);
+	int result = read ? execute_autofence(target) : ERROR_OK;
+	if (result == ERROR_OK) {
+		result = riscv013_direct_select_hart(target);
+		if (result == ERROR_OK) {
+			LOG_TARGET_DEBUG(target, "Using adapter direct Program Buffer memory");
+			result = riscv013_direct_memory(target, args, RISCV_DIRECT_PROGBUF);
+		}
+		/* Invalidate on success and failure: firmware may have overwritten it. */
+		riscv013_invalidate_cached_progbuf(target);
+		/* A failed offload may leave autoexec armed. Do not issue another
+		 * abstract command until idle and disabled autoexec are verified. */
+		if (result != ERROR_OK && (progbuf_clear_autoexec(target) != ERROR_OK ||
+				riscv013_clear_abstract_error(target) != ERROR_OK))
+			goto unsafe_cleanup;
+		/* Match OpenOCD's Program Buffer write path: synchronize instruction
+		 * and data accesses after writes, including after an error. */
+		if (!read && execute_autofence(target) != ERROR_OK) {
+			result = ERROR_FAIL;
+		}
+	}
+	/* This also covers a failure in the pre-read or post-write fence. */
+	if (result != ERROR_OK && (progbuf_clear_autoexec(target) != ERROR_OK ||
+			riscv013_clear_abstract_error(target) != ERROR_OK))
+		goto unsafe_cleanup;
+	if (restore_privilege_progbuf(target, mstatus, mstatus_old,
+			mstatush, mstatush_old, dcsr, dcsr_old) != ERROR_OK) {
+		return ERROR_FAIL;
+	}
+	return result;
+unsafe_cleanup:
+	LOG_TARGET_ERROR(target, "Could not establish safe Program Buffer state after offload failure; "
+			"reset the Debug Module before further access");
+	return ERROR_FAIL;
+}
+
+static int riscv013_direct_progbuf_outer_memory(struct target *target, const struct riscv_mem_access_args args)
+{
+	RISCV_INFO(r);
+	if (adapter_driver->riscv_debug_ops && adapter_driver->riscv_debug_ops->memory &&
+			adapter_driver->riscv_debug_ops->select_hart &&
+			target->dbgbase == 0 && args.count &&
+			target->state == TARGET_HALTED && r->num_enabled_mem_access_methods &&
+			r->mem_access_methods[0] == RISCV_MEM_ACCESS_PROGBUF &&
+			args.mode == RISCV_MODE_M && args.increment == args.size &&
+			(args.size == 1 || args.size == 2 || args.size == 4 || args.size == 8) &&
+			args.address % args.size == 0 &&
+			(uint64_t)args.count * args.size - 1 <= UINT64_MAX - args.address &&
+			is_mem_access_ok(mem_should_skip_progbuf(target, args))) {
+		RISCV013_INFO(info);
+		/* Firmware XLEN discovery requires two abstract data registers, and
+		 * its Program Buffer engine requires two actual buffer words. */
+		if (info->datacount < 2 || info->progbufsize < 2 || target->coreid < 0 ||
+				(riscv_xlen(target) == 32 &&
+				 args.address + (uint64_t)args.count * args.size - 1 > UINT32_MAX)) {
+			return ERROR_NOT_IMPLEMENTED;
+		}
+		int supported = riscv013_adapter_has_capability(ADAPTER_CAP_RISCV_MEMORY_PROGBUF);
+		if (supported < 0) {
+			return ERROR_FAIL;
+		}
+		if (supported) {
+			return riscv013_direct_progbuf_memory(target, args);
+		}
+	}
+	return ERROR_NOT_IMPLEMENTED;
+}
+
+static int riscv013_direct_sba_outer_memory(struct target *target, const struct riscv_mem_access_args args)
+{
+	RISCV_INFO(r);
+	if (adapter_driver->riscv_debug_ops && adapter_driver->riscv_debug_ops->memory &&
+			target->dbgbase == 0 && args.count &&
+			(target->state == TARGET_HALTED || target->state == TARGET_RUNNING) &&
+			r->num_enabled_mem_access_methods &&
+			r->mem_access_methods[0] == RISCV_MEM_ACCESS_SYSBUS &&
+			args.mode == RISCV_MODE_M && args.increment == args.size &&
+			(args.size == 1 || args.size == 2 || args.size == 4 || args.size == 8) &&
+			args.address % args.size == 0 &&
+			(uint64_t)args.count * args.size - 1 <= UINT64_MAX - args.address &&
+			is_mem_access_ok(mem_should_skip_sysbus(target, args))) {
+		RISCV013_INFO(info);
+		if (get_field(info->sbcs, DM_SBCS_SBVERSION) == 1) {
+			int supported = riscv013_adapter_has_capability(ADAPTER_CAP_RISCV_MEMORY_SBA);
+			if (supported < 0) {
+				return ERROR_FAIL;
+			}
+			if (supported) {
+				LOG_TARGET_DEBUG(target, "Using adapter direct SBA memory");
+				return riscv013_direct_memory(target, args, RISCV_DIRECT_SBA);
+			}
+		}
+	}
+	return ERROR_NOT_IMPLEMENTED;
+}
+
+/* Offload only the explicitly selected method and only when firmware
+ * advertises the abstract-only commands. Never retry a failed transfer: an
+ * error may follow a side-effecting or partially completed operation. */
+static int riscv013_direct_abstract_outer_memory(struct target *target, const struct riscv_mem_access_args args)
+{
+	RISCV_INFO(r);
+	if (!adapter_driver->riscv_debug_ops || !adapter_driver->riscv_debug_ops->memory ||
+			!adapter_driver->riscv_debug_ops->select_hart ||
+			target->dbgbase != 0 || !args.count || target->state != TARGET_HALTED ||
+			!r->num_enabled_mem_access_methods ||
+			r->mem_access_methods[0] != RISCV_MEM_ACCESS_ABSTRACT ||
+			args.mode != RISCV_MODE_M || args.increment != args.size ||
+			(args.size != 1 && args.size != 2 && args.size != 4 && args.size != 8) ||
+			args.address % args.size != 0 ||
+			(uint64_t)args.count * args.size - 1 > UINT64_MAX - args.address ||
+			!is_mem_access_ok(mem_should_skip_abstract(target, args))) {
+		return ERROR_NOT_IMPLEMENTED;
+	}
+	RISCV013_INFO(info);
+	const unsigned int xlen = riscv_xlen(target);
+	if (target->coreid < 0 || (xlen != 32 && xlen != 64) ||
+			args.size * 8 > xlen || info->datacount < 2 * (xlen / 32) ||
+			(xlen == 32 && args.address + (uint64_t)args.count * args.size - 1 > UINT32_MAX)) {
+		return ERROR_NOT_IMPLEMENTED;
+	}
+	int supported = riscv013_adapter_has_capability(ADAPTER_CAP_RISCV_MEMORY_ABSTRACT);
+	if (supported < 0) {
+		return ERROR_FAIL;
+	}
+	if (!supported) {
+		return ERROR_NOT_IMPLEMENTED;
+	}
+	if (riscv013_direct_select_hart(target) != ERROR_OK) {
+		return ERROR_FAIL;
+	}
+	LOG_TARGET_DEBUG(target, "Using adapter direct abstract memory");
+	return riscv013_direct_memory(target, args, RISCV_DIRECT_ABSTRACT);
+}
+
 static int
 riscv013_access_memory(struct target *target, const struct riscv_mem_access_args args)
 {
 	assert(riscv_mem_access_is_valid(args));
+	/* Internal scratch accesses must not replace an active Program Buffer. */
+	RISCV_INFO(r);
+	if (args.allow_adapter_offload && adapter_driver->riscv_debug_ops &&
+			adapter_driver->riscv_debug_ops->memory && r->dtm_version == 1) {
+		int result = riscv013_direct_progbuf_outer_memory(target, args);
+		if (result != ERROR_NOT_IMPLEMENTED) {
+			return result;
+		}
+		result = riscv013_direct_sba_outer_memory(target, args);
+		if (result != ERROR_NOT_IMPLEMENTED) {
+			return result;
+		}
+		result = riscv013_direct_abstract_outer_memory(target, args);
+		if (result != ERROR_NOT_IMPLEMENTED) {
+			return result;
+		}
+	}
 
 	const bool is_read = riscv_mem_access_is_read(args);
 	const char *const access_type = is_read ? "read" : "write";
@@ -5210,7 +5449,6 @@ riscv013_access_memory(struct target *target, const struct riscv_mem_access_args
 		[RISCV_MEM_ACCESS_ABSTRACT] = mem_access_result(MEM_ACCESS_DISABLED),
 	};
 
-	RISCV_INFO(r);
 	for (unsigned int i = 0; i < r->num_enabled_mem_access_methods; ++i) {
 		enum riscv_mem_access_method method = r->mem_access_methods[i];
 		switch (method) {
@@ -5229,13 +5467,15 @@ riscv013_access_memory(struct target *target, const struct riscv_mem_access_args
 			goto failure;
 		}
 
-		if (is_mem_access_failed(skip_reason[method]))
+		if (is_mem_access_failed(skip_reason[method])) {
 			goto failure;
+		}
 
 		const bool success = is_mem_access_ok(skip_reason[method]);
 		log_mem_access_result(target, success, method, is_read);
-		if (success)
+		if (success) {
 			return ERROR_OK;
+		}
 	}
 
 failure:
@@ -5850,7 +6090,7 @@ write_memory_progbuf_multiword(struct target *target, const struct riscv_mem_acc
 		if (timeval_ms() >= retry_deadline)
 			goto cleanup;
 
-		if (progbuf_multiword_clear_autoexec(target) != ERROR_OK ||
+		if (progbuf_clear_autoexec(target) != ERROR_OK ||
 				riscv013_clear_abstract_error(target) != ERROR_OK ||
 				increase_ac_busy_delay(target) != ERROR_OK)
 			goto cleanup;
@@ -5879,7 +6119,7 @@ write_memory_progbuf_multiword(struct target *target, const struct riscv_mem_acc
 			goto cleanup;
 	}
 
-	if (progbuf_multiword_clear_autoexec(target) != ERROR_OK)
+	if (progbuf_clear_autoexec(target) != ERROR_OK)
 		goto cleanup;
 	riscv_reg_t address_on_target;
 	if (register_read_abstract(target, &address_on_target, GDB_REGNO_S0) != ERROR_OK)
@@ -5921,7 +6161,7 @@ cleanup:
 		riscv_scan_set_delay(&info->learned_delays, RISCV_DELAY_ABSTRACT_COMMAND,
 				saved_ac_delay);
 	}
-	if (progbuf_multiword_clear_autoexec(target) != ERROR_OK) {
+	if (progbuf_clear_autoexec(target) != ERROR_OK) {
 		LOG_TARGET_ERROR(target, "Could not disable Program Buffer autoexec; "
 				"reset the Debug Module before further memory access");
 		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);

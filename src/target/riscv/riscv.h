@@ -151,6 +151,8 @@ struct riscv_mem_access_args {
 	uint32_t size;
 	uint32_t count;
 	uint32_t increment;
+	/* Internal scratch and page-table accesses leave this unset. */
+	bool allow_adapter_offload;
 };
 
 static inline bool

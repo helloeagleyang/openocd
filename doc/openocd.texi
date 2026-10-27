@@ -12120,7 +12120,8 @@ By default, all memory access methods are enabled in the following order:
 This command can be used to change the memory access methods if the default
 behavior is not suitable for a particular target.
 For SBA v1 block reads, OpenOCD batches up to 32 data words when the Debug
-Module supports read-on-data and address autoincrement.
+Module supports read-on-data and address autoincrement. Direct DMI adapters
+and adapters that explicitly disable batching retain one-word reads.
 @end deffn
 
 @deffn {Command} {riscv progbuf_read_multiword} [@option{on}|@option{off}]

@@ -9,6 +9,8 @@
 #include "debug_reg_printer.h"
 #include "riscv.h"
 #include "field_helpers.h"
+#include <jtag/adapter.h>
+#include <jtag/interface.h>
 
 // TODO: DTM_DMI_MAX_ADDRESS_LENGTH should be reduced to 32 (per the debug spec)
 #define DTM_DMI_MAX_ADDRESS_LENGTH	((1<<DTM_DTMCS_ABITS_LENGTH)-1)
@@ -285,24 +287,65 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 	assert(!batch->was_run || riscv_batch_was_scan_busy(batch, start_idx));
 	assert(start_idx == 0 || !riscv_batch_was_scan_busy(batch, start_idx - 1));
 
-	if (batch->was_run)
+	if (adapter_driver->riscv_debug_ops && adapter_driver->riscv_debug_ops->dmi) {
+		/* Firmware performs each transaction to completion. Recreate the
+		 * one-scan DMI pipeline expected by OpenOCD's batch code. */
+		uint32_t previous_data = 0, previous_address = 0;
+		unsigned int abits = riscv_get_dmi_address_bits(batch->target);
+		if (abits > 32 || bscan_tunnel_ir_width != 0 || start_idx != 0) {
+			return ERROR_NOT_IMPLEMENTED;
+		}
+		for (size_t i = start_idx; i < batch->used_scans; ++i) {
+			struct scan_field *field = &batch->fields[i];
+			uint32_t op = buf_get_u32(field->out_value, DTM_DMI_OP_OFFSET, DTM_DMI_OP_LENGTH);
+			uint32_t address = buf_get_u32(field->out_value, DTM_DMI_ADDRESS_OFFSET, abits);
+			uint32_t data = buf_get_u32(field->out_value, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH);
+			if (field->in_value) {
+				memset(field->in_value, 0, DIV_ROUND_UP(field->num_bits, 8));
+				buf_set_u32(field->in_value, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH, previous_data);
+				buf_set_u32(field->in_value, DTM_DMI_ADDRESS_OFFSET, abits, previous_address);
+			}
+			previous_data = 0;
+			previous_address = address;
+			if (op == DTM_DMI_OP_READ || op == DTM_DMI_OP_WRITE) {
+				if (adapter_driver->riscv_debug_ops->dmi(op == DTM_DMI_OP_WRITE,
+						address, &data) != ERROR_OK) {
+					return ERROR_FAIL;
+				}
+				if (op == DTM_DMI_OP_READ) {
+					previous_data = data;
+				}
+			} else if (op != DTM_DMI_OP_NOP) {
+				return ERROR_FAIL;
+			}
+		}
+		batch->was_run = true;
+		batch->last_scan_delay = get_delay(batch, batch->used_scans - 1,
+				delays, resets_delays, reset_delays_after);
+		return ERROR_OK;
+	}
+
+	if (batch->was_run) {
 		add_idle_before_batch(batch, start_idx, delays);
+	}
 
 	LOG_TARGET_DEBUG(batch->target, "Running batch of scans [%zu, %zu)",
 			start_idx, batch->used_scans);
 
 	unsigned int delay = 0 /* to silence maybe-uninitialized */;
 	for (size_t i = start_idx; i < batch->used_scans; ++i) {
-		if (bscan_tunnel_ir_width != 0)
+		if (bscan_tunnel_ir_width != 0) {
 			riscv_add_bscan_tunneled_scan(batch->target->tap, batch->fields + i,
 							batch->bscan_ctxt + i);
-		else
+		} else {
 			jtag_add_dr_scan(batch->target->tap, 1, batch->fields + i, TAP_IDLE);
+		}
 
 		delay = get_delay(batch, i, delays, resets_delays,
 				reset_delays_after);
-		if (delay > 0)
+		if (delay > 0) {
 			jtag_add_runtest(delay, TAP_IDLE);
+		}
 	}
 
 	keep_alive();

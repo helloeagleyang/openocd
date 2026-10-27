@@ -14,6 +14,7 @@
 #ifndef OPENOCD_JTAG_INTERFACE_H
 #define OPENOCD_JTAG_INTERFACE_H
 
+#include <helper/bits.h>
 #include <jtag/jtag.h>
 #include <jtag/swim.h>
 #include <target/arm_tpiu_swo.h>
@@ -178,6 +179,40 @@ static inline enum tap_state jtag_debug_state_machine(const void *tms_buf,
 	else
 		return start_tap_state;
 }
+
+/* Optional direct RISC-V transport. Successful callbacks complete their
+ * operations before returning. A successful Program Buffer memory callback
+ * must leave the abstract command idle and autoexec disabled. A failed memory
+ * operation may have partially completed and must not be replayed; it may also
+ * leave an abstract command busy or autoexec armed. The caller must restore a
+ * safe DM state before issuing another abstract command. The adapter may change
+ * DM hart selection; the caller must invalidate its selection cache after
+ * direct operations. */
+enum riscv_direct_memory_method {
+	RISCV_DIRECT_SBA,
+	RISCV_DIRECT_PROGBUF,
+	RISCV_DIRECT_ABSTRACT,
+};
+
+/* Optional firmware capabilities and runtime feature state. */
+#define ADAPTER_CAP_RISCV_MEMORY_SBA      BIT(0)
+#define ADAPTER_CAP_RISCV_MEMORY_PROGBUF  BIT(1)
+#define ADAPTER_CAP_RISCV_MEMORY_ABSTRACT BIT(2)
+#define ADAPTER_CAP_RISCV_DMI_READ_BATCH  BIT(3)
+
+struct adapter_capability_ops {
+	int (*query)(uint32_t *supported, uint32_t *enabled);
+};
+
+/* Each callback is optional. Missing DTMCS/DMI callbacks use JTAG scans;
+ * memory offload requires memory, plus select_hart for hart-specific methods. */
+struct riscv_debug_ops {
+	int (*dtmcs)(uint32_t out, uint32_t *in);
+	int (*dmi)(bool write, uint32_t address, uint32_t *data);
+	int (*select_hart)(uint32_t hartid);
+	int (*memory)(enum riscv_direct_memory_method method, uint64_t address,
+		uint32_t size, uint32_t count, uint8_t *read_buffer, const uint8_t *write_buffer);
+};
 
 /**
  * Represents a driver for a debugging interface.
@@ -357,6 +392,12 @@ struct adapter_driver {
 	 * @returns ERROR_OK on success, an error code on failure.
 	 */
 	int (*poll_trace)(uint8_t *buf, size_t *size);
+
+	/** Optional runtime feature discovery. A NULL interface reports no features. */
+	const struct adapter_capability_ops *capabilities;
+
+	/** Optional RISC-V debug operations without raw JTAG scans. */
+	const struct riscv_debug_ops *riscv_debug_ops;
 
 	/** Low-level JTAG APIs */
 	struct jtag_interface *jtag_ops;
