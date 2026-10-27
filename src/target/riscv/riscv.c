@@ -2539,8 +2539,9 @@ static int riscv_examine(struct target *target)
 			return ERROR_FAIL;
 		}
 		tt = get_target_type(target);
-		if (!tt)
+		if (!tt) {
 			return ERROR_FAIL;
+		}
 	}
 
 	return tt->examine(target);
@@ -4457,6 +4458,20 @@ COMMAND_HANDLER(riscv_set_reset_timeout_sec)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(riscv_reset_halt_retry)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(r);
+	if (CMD_ARGC > 1) {
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (CMD_ARGC == 1) {
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], r->reset_halt_retry);
+	}
+	command_print(CMD, "%s", r->reset_halt_retry ? "on" : "off");
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(riscv_mem_access)
 {
 	struct target *target = get_current_target(CMD_CTX);
@@ -5829,6 +5844,13 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.usage = "sec",
 		.help = "Set the wall-clock timeout (in seconds) for individual commands"
+	},
+	{
+		.name = "reset_halt_retry",
+		.handler = riscv_reset_halt_retry,
+		.mode = COMMAND_ANY,
+		.usage = "[on|off]",
+		.help = "Retry halt while debug access recovers after reset"
 	},
 	{
 		.name = "set_reset_timeout_sec",

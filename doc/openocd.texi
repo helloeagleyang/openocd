@@ -12090,6 +12090,17 @@ Set the wall-clock timeout (in seconds) for individual commands. The default
 should work fine for all but the slowest targets (eg. simulators).
 @end deffn
 
+@deffn {Command} {riscv reset_halt_retry} [@option{on}|@option{off}]
+Enable timed halt recovery for targets whose debug access disappears briefly
+after reset. The default is @option{off}. When enabled, OpenOCD clears an old
+reset indication before resetting and repeats the halt request until a fresh
+reset indication and halted state appear, or the command timeout expires.
+It also accepts a resume acknowledgment while the hart is temporarily
+unavailable after resuming.
+The setting belongs to the selected RISC-V target and applies with any adapter.
+With no argument, display the current setting.
+@end deffn
+
 @deffn {Command} {riscv mem_access} [method1 [method2 [method3]]]
 Specify which RISC-V memory access method(s) shall be used, and in which order
 of priority. At least one method must be specified.

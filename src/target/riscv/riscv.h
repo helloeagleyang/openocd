@@ -239,6 +239,8 @@ struct riscv_info {
 	/* Decremented every scan, and when it reaches 0 we clear the learned
 	 * delays, causing them to be relearned. Used for testing. */
 	int reset_delays_wait;
+	/* Retry halt through a target's temporary post-reset debug blackout. */
+	bool reset_halt_retry;
 
 	/* This target has been prepped and is ready to step/resume. */
 	bool prepped;

@@ -120,6 +120,8 @@ typedef struct {
 	bool was_examined;
 	/* Indicates we already reset this DM, so don't need to do it again. */
 	bool was_reset;
+	/* Opted-in harts were prepared before this DM's reset assertion phase. */
+	bool reset_halt_prepared;
 	/* Targets that are connected to this DM. */
 	struct list_head target_list;
 	/* Contains the ID of the hart that is currently selected by this DM.
@@ -1882,6 +1884,43 @@ static int wait_for_idle_if_needed(struct target *target)
 	return ERROR_OK;
 }
 
+/* Some targets discard a halt request while debug is disabled during reset.
+ * Retry the level request until the DM confirms the hart is halted. */
+static int wait_for_halt_retry(struct target *target, uint32_t control,
+		bool after_reset, uint32_t *last_dmstatus)
+{
+	int64_t deadline = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
+	int64_t next_request = 0;
+	bool saw_reset = !after_reset;
+	*last_dmstatus = 0;
+	do {
+		int64_t now = timeval_ms();
+		if (now >= next_request) {
+			/* A write may be ignored while the target's debug logic is unavailable. */
+			(void)dm_write(target, DM_DMCONTROL, control);
+			next_request = now + 100;
+		}
+		uint32_t dmstatus;
+		if (dmstatus_read(target, &dmstatus, true) == ERROR_OK) {
+			*last_dmstatus = dmstatus;
+			if (after_reset && get_field(dmstatus, DM_DMSTATUS_ALLHAVERESET)) {
+				saw_reset = true;
+			}
+			if (get_field(dmstatus, DM_DMSTATUS_VERSION) == DM_DMSTATUS_VERSION_1_0 &&
+					get_field(dmstatus, DM_DMSTATUS_STICKYUNAVAIL)) {
+				(void)dm_write(target, DM_DMCONTROL, control | DM_DMCONTROL_ACKUNAVAIL);
+			}
+			if (saw_reset && get_field(dmstatus, DM_DMSTATUS_ALLHALTED)) {
+				return ERROR_OK;
+			}
+		}
+		alive_sleep(10);
+	} while (timeval_ms() < deadline);
+	LOG_TARGET_ERROR(target, "Timed out waiting for reset/halt recovery (dmstatus=0x%08x)",
+			*last_dmstatus);
+	return ERROR_TIMEOUT_REACHED;
+}
+
 static int reset_dm(struct target *target)
 {
 	/* TODO: This function returns an error when a DMI operation fails.
@@ -2095,8 +2134,9 @@ static int examine(struct target *target)
 	}
 
 	int result = examine_dm(target);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
 	dm013_info_t *dm = get_dm(target);
 	assert(dm);
@@ -2118,16 +2158,18 @@ static int examine(struct target *target)
 	}
 
 	result = dm013_select_target(target);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
 	/* We're here because we're uncertain about the state of the target. That
 	 * includes our progbuf cache. */
 	riscv013_invalidate_cached_progbuf(target);
 
 	uint32_t dmstatus;
-	if (dmstatus_read(target, &dmstatus, false) != ERROR_OK)
+	if (dmstatus_read(target, &dmstatus, false) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 	LOG_TARGET_DEBUG(target, "dmstatus:  0x%08x", dmstatus);
 	int dmstatus_version = get_field(dmstatus, DM_DMSTATUS_VERSION);
 	if (dmstatus_version != 2 && dmstatus_version != 3) {
@@ -2136,8 +2178,9 @@ static int examine(struct target *target)
 	}
 
 	uint32_t hartinfo;
-	if (dm_read(target, &hartinfo, DM_HARTINFO) != ERROR_OK)
+	if (dm_read(target, &hartinfo, DM_HARTINFO) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	info->datasize = get_field(hartinfo, DM_HARTINFO_DATASIZE);
 	info->dataaccess = get_field(hartinfo, DM_HARTINFO_DATAACCESS);
@@ -2150,13 +2193,15 @@ static int examine(struct target *target)
 		return ERROR_FAIL;
 	}
 
-	if (dm_read(target, &info->sbcs, DM_SBCS) != ERROR_OK)
+	if (dm_read(target, &info->sbcs, DM_SBCS) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	/* Check that abstract data registers are accessible. */
 	uint32_t abstractcs;
-	if (dm_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK)
+	if (dm_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 	info->datacount = get_field(abstractcs, DM_ABSTRACTCS_DATACOUNT);
 	info->progbufsize = get_field(abstractcs, DM_ABSTRACTCS_PROGBUFSIZE);
 
@@ -2176,10 +2221,12 @@ static int examine(struct target *target)
 	 * cores and initialized registers. */
 
 	enum riscv_hart_state state_at_examine_start;
-	if (riscv_get_hart_state(target, &state_at_examine_start) != ERROR_OK)
+	if (riscv_get_hart_state(target, &state_at_examine_start) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
-	if (state_at_examine_start == RISCV_STATE_UNAVAILABLE) {
+	if (state_at_examine_start == RISCV_STATE_UNAVAILABLE &&
+			!riscv_info(target)->reset_halt_retry) {
 		target->state = TARGET_UNAVAILABLE;
 		LOG_TARGET_INFO(target, "unavailable.");
 		return ERROR_FAIL;
@@ -2200,11 +2247,13 @@ static int examine(struct target *target)
 	target->debug_reason = hart_halted_at_examine_start ? DBG_REASON_UNDEFINED : DBG_REASON_DBGRQ;
 
 	result = riscv013_reg_examine_all(target);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
-	if (set_dcsr_config(target, false) != ERROR_OK)
+	if (set_dcsr_config(target, false) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	if (state_at_examine_start == RISCV_STATE_RUNNING) {
 		riscv013_step_or_resume_current_hart(target, false);
@@ -2216,14 +2265,16 @@ static int examine(struct target *target)
 	}
 
 	if (target->smp) {
-		if (set_group(target, &info->haltgroup_supported, target->smp_id, HALT_GROUP) != ERROR_OK)
+		if (set_group(target, &info->haltgroup_supported, target->smp_id, HALT_GROUP) != ERROR_OK) {
 			return ERROR_FAIL;
-		if (info->haltgroup_supported)
+		}
+		if (info->haltgroup_supported) {
 			LOG_TARGET_INFO(target, "Core %d made part of halt group %d.", info->index,
 					target->smp_id);
-		else
+		} else {
 			LOG_TARGET_INFO(target, "Core %d could not be made part of halt group %d.",
 					info->index, target->smp_id);
+		}
 	}
 
 	/* Some regression suites rely on seeing 'Examined RISC-V core' to know
@@ -2973,20 +3024,79 @@ static int init_target(struct command_context *cmd_ctx,
 	return ERROR_OK;
 }
 
+/* NDMRESET is shared by every hart in a DM. Prepare all opted-in harts
+ * before the first assertion, since selecting another hart through the
+ * ordinary helper would clear NDMRESET. Do not inspect DMSTATUS while reset
+ * is held. */
+static int prepare_reset_halt_retry(struct target *target)
+{
+	dm013_info_t *dm = get_dm(target);
+	if (!dm)
+		return ERROR_FAIL;
+	if (dm->reset_halt_prepared)
+		return ERROR_OK;
+
+	bool retry = false;
+	struct target_list *entry;
+	list_for_each_entry(entry, &dm->target_list, lh) {
+		if (target_was_examined(entry->target) && riscv_info(entry->target)->reset_halt_retry)
+			retry = true;
+	}
+	if (!retry)
+		return ERROR_OK;
+
+	uint32_t control;
+	if (dm_read(target, &control, DM_DMCONTROL) != ERROR_OK)
+		return ERROR_FAIL;
+	if (control & DM_DMCONTROL_NDMRESET) {
+		LOG_TARGET_ERROR(target, "Cannot prepare a fresh reset while NDMRESET is already asserted");
+		return ERROR_FAIL;
+	}
+	if (wait_for_idle_if_needed(target) != ERROR_OK)
+		return ERROR_FAIL;
+
+	list_for_each_entry(entry, &dm->target_list, lh) {
+		struct target *t = entry->target;
+		if (!target_was_examined(t) || !riscv_info(t)->reset_halt_retry)
+			continue;
+		if (dm013_select_target(t) != ERROR_OK)
+			return ERROR_FAIL;
+		riscv013_info_t *info = get_info(t);
+		control = set_dmcontrol_hartsel(DM_DMCONTROL_DMACTIVE, info->index);
+		if (dm_write(t, DM_DMCONTROL, control | DM_DMCONTROL_ACKHAVERESET) != ERROR_OK)
+			return ERROR_FAIL;
+		uint32_t status;
+		if (dmstatus_read(t, &status, true) != ERROR_OK)
+			return ERROR_FAIL;
+		if (status & DM_DMSTATUS_ANYHAVERESET) {
+			LOG_TARGET_ERROR(t, "Could not clear the previous reset indication");
+			return ERROR_FAIL;
+		}
+	}
+	if (dm013_select_target(target) != ERROR_OK)
+		return ERROR_FAIL;
+	dm->reset_halt_prepared = true;
+	return ERROR_OK;
+}
+
 static int assert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
 	int result;
 
 	select_dmi(target->tap);
+	result = prepare_reset_halt_retry(target);
+	if (result != ERROR_OK)
+		return result;
 
 	if (target_has_event_action(target, TARGET_EVENT_RESET_ASSERT)) {
 		/* Run the user-supplied script if there is one. */
 		target_handle_event(target, TARGET_EVENT_RESET_ASSERT);
 	} else {
 		dm013_info_t *dm = get_dm(target);
-		if (!dm)
+		if (!dm) {
 			return ERROR_FAIL;
+		}
 
 		uint32_t control = set_field(0, DM_DMCONTROL_DMACTIVE, 1);
 		control = set_dmcontrol_hartsel(control, info->index);
@@ -2999,12 +3109,18 @@ static int assert_reset(struct target *target)
 		const bool hartsel_changed = (int)info->index != dm->current_hartid;
 		if (hartsel_changed || target->reset_halt) {
 			result = wait_for_idle_if_needed(target);
-			if (result != ERROR_OK)
+			if (result != ERROR_OK) {
+				dm->reset_halt_prepared = false;
 				return result;
+			}
 		}
+		dm->current_hartid = HART_INDEX_UNKNOWN;
 		result = dm_write(target, DM_DMCONTROL, control);
-		if (result != ERROR_OK)
+		if (result != ERROR_OK) {
+			dm->reset_halt_prepared = false;
 			return result;
+		}
+		dm->current_hartid = info->index;
 	}
 
 	target->state = TARGET_RESET;
@@ -3024,13 +3140,36 @@ static bool dcsr_config_equals_reset_value(const struct target *target)
 	return !config->dcsr_cetrig;
 }
 
+static void reset_halt_failed(struct target *target, riscv013_info_t *info)
+{
+	/* Keep the DM's current hart selection: abstractcs.busy may still be set. */
+	dm013_info_t *dm = get_dm(target);
+	if (dm)
+		dm->current_hartid = HART_INDEX_UNKNOWN;
+	uint32_t control;
+	int result = dm_read(target, &control, DM_DMCONTROL);
+	if (result == ERROR_OK) {
+		control &= DM_DMCONTROL_HARTSELLO | DM_DMCONTROL_HARTSELHI | DM_DMCONTROL_HASEL;
+		control |= DM_DMCONTROL_DMACTIVE;
+		result = dm_write(target, DM_DMCONTROL, control);
+	}
+	if (result != ERROR_OK) {
+		LOG_TARGET_ERROR(target, "Could not clear reset and halt requests after reset failure");
+	}
+	target->state = TARGET_UNKNOWN;
+	info->dcsr_register_is_set = false;
+}
+
 static int deassert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
 	dm013_info_t *dm = get_dm(target);
-	if (!dm)
+	if (!dm) {
 		return ERROR_FAIL;
+	}
 	int result;
+	/* All target assertions precede the first deassertion. */
+	dm->reset_halt_prepared = false;
 
 	select_dmi(target->tap);
 	/* Clear the reset, but make sure haltreq is still set */
@@ -3044,12 +3183,41 @@ static int deassert_reset(struct target *target)
 	const bool hartsel_changed = (int)info->index != dm->current_hartid;
 	if (hartsel_changed) {
 		result = wait_for_idle_if_needed(target);
-		if (result != ERROR_OK)
+		if (result != ERROR_OK) {
+			if (riscv_info(target)->reset_halt_retry && target->reset_halt) {
+				reset_halt_failed(target, info);
+			}
 			return result;
+		}
 	}
+	if (riscv_info(target)->reset_halt_retry && target->reset_halt) {
+		/* The retry writes hartsel directly, including on a failed attempt. */
+		dm->current_hartid = HART_INDEX_UNKNOWN;
+		uint32_t dmstatus;
+		result = wait_for_halt_retry(target, control, true, &dmstatus);
+		uint32_t base = set_dmcontrol_hartsel(DM_DMCONTROL_DMACTIVE, info->index);
+		if (result == ERROR_OK) {
+			result = wait_for_idle_if_needed(target);
+		}
+		if (result == ERROR_OK) {
+			result = dm_write(target, DM_DMCONTROL, base | DM_DMCONTROL_ACKHAVERESET);
+		}
+		if (result != ERROR_OK) {
+			reset_halt_failed(target, info);
+			return result;
+		}
+		dm->current_hartid = info->index;
+		target->state = TARGET_HALTED;
+		target->debug_reason = DBG_REASON_DBGRQ;
+		info->dcsr_register_is_set = dcsr_config_equals_reset_value(target);
+		return ERROR_OK;
+	}
+	dm->current_hartid = HART_INDEX_UNKNOWN;
 	result = dm_write(target, DM_DMCONTROL, control);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
+	dm->current_hartid = info->index;
 
 	uint32_t dmstatus;
 	const unsigned int orig_base_delay = riscv_scan_get_delay(&info->learned_delays,
@@ -3058,8 +3226,9 @@ static int deassert_reset(struct target *target)
 	LOG_TARGET_DEBUG(target, "Waiting for hart to come out of reset.");
 	do {
 		result = dmstatus_read(target, &dmstatus, true);
-		if (result != ERROR_OK)
+		if (result != ERROR_OK) {
 			return result;
+		}
 
 		if (timeval_ms() > then) {
 			LOG_TARGET_ERROR(target, "Hart didn't leave reset in %ds; "
@@ -3081,8 +3250,9 @@ static int deassert_reset(struct target *target)
 	control = set_field(control, DM_DMCONTROL_ACKHAVERESET, 1);
 	control = set_dmcontrol_hartsel(control, info->index);
 	result = dm_write(target, DM_DMCONTROL, control);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
 	if (target->reset_halt) {
 		target->state = TARGET_HALTED;
@@ -5963,46 +6133,61 @@ static int riscv013_halt_prep(struct target *target)
 static int riscv013_halt_go(struct target *target)
 {
 	dm013_info_t *dm = get_dm(target);
-	if (!dm)
+	if (!dm) {
 		return ERROR_FAIL;
+	}
 
-	if (select_prepped_harts(target) != ERROR_OK)
+	if (select_prepped_harts(target) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	LOG_TARGET_DEBUG(target, "halting hart");
 
 	/* `haltreq` should not be issued if `abstractcs.busy` is set. */
 	int result = wait_for_idle_if_needed(target);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
 
 	/* Issue the halt command, and then wait for the current hart to halt. */
 	uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE | DM_DMCONTROL_HALTREQ;
 	dmcontrol = set_dmcontrol_hartsel(dmcontrol, dm->current_hartid);
-	dm_write(target, DM_DMCONTROL, dmcontrol);
 	uint32_t dmstatus;
-	for (size_t i = 0; i < 256; ++i) {
-		if (dmstatus_read(target, &dmstatus, true) != ERROR_OK)
+	if (riscv_info(target)->reset_halt_retry) {
+		result = wait_for_halt_retry(target, dmcontrol, false, &dmstatus);
+		uint32_t base = set_field(dmcontrol, DM_DMCONTROL_HALTREQ, 0);
+		int clear_result = dm_write(target, DM_DMCONTROL, base);
+		if (clear_result != ERROR_OK) {
+			return clear_result;
+		}
+		if (result != ERROR_OK) {
+			return result;
+		}
+	} else {
+		dm_write(target, DM_DMCONTROL, dmcontrol);
+		for (size_t i = 0; i < 256; ++i) {
+			if (dmstatus_read(target, &dmstatus, true) != ERROR_OK) {
+				return ERROR_FAIL;
+			}
+			/* When no harts are running, there's no point in continuing this loop. */
+			if (!get_field(dmstatus, DM_DMSTATUS_ANYRUNNING)) {
+				break;
+			}
+		}
+
+		/* We declare success if no harts are running. One or more of them may be
+		 * unavailable, though. */
+		if (get_field(dmstatus, DM_DMSTATUS_ANYRUNNING)) {
+			if (dm_read(target, &dmcontrol, DM_DMCONTROL) != ERROR_OK) {
+				return ERROR_FAIL;
+			}
+			LOG_TARGET_ERROR(target, "Unable to halt. dmcontrol=0x%08x, dmstatus=0x%08x",
+					dmcontrol, dmstatus);
 			return ERROR_FAIL;
-		/* When no harts are running, there's no point in continuing this loop. */
-		if (!get_field(dmstatus, DM_DMSTATUS_ANYRUNNING))
-			break;
+		}
+		dmcontrol = set_field(dmcontrol, DM_DMCONTROL_HALTREQ, 0);
+		dm_write(target, DM_DMCONTROL, dmcontrol);
 	}
-
-	/* We declare success if no harts are running. One or more of them may be
-	 * unavailable, though. */
-
-	if ((get_field(dmstatus, DM_DMSTATUS_ANYRUNNING))) {
-		if (dm_read(target, &dmcontrol, DM_DMCONTROL) != ERROR_OK)
-			return ERROR_FAIL;
-
-		LOG_TARGET_ERROR(target, "Unable to halt. dmcontrol=0x%08x, dmstatus=0x%08x",
-				  dmcontrol, dmstatus);
-		return ERROR_FAIL;
-	}
-
-	dmcontrol = set_field(dmcontrol, DM_DMCONTROL_HALTREQ, 0);
-	dm_write(target, DM_DMCONTROL, dmcontrol);
 
 	if (dm->current_hartid == HART_INDEX_MULTIPLE) {
 		struct target_list *entry;
@@ -6018,16 +6203,19 @@ static int riscv013_halt_go(struct target *target)
 				/* Only some harts were halted/unavailable. Read
 				 * dmstatus for this one to see what its status
 				 * is. */
-				if (dm013_select_target(target) != ERROR_OK)
+				if (dm013_select_target(target) != ERROR_OK) {
 					return ERROR_FAIL;
-				if (dm_read(target, &t_dmstatus, DM_DMSTATUS) != ERROR_OK)
+				}
+				if (dm_read(target, &t_dmstatus, DM_DMSTATUS) != ERROR_OK) {
 					return ERROR_FAIL;
+				}
 			}
 			/* Set state for the current target based on its dmstatus. */
 			if (get_field(t_dmstatus, DM_DMSTATUS_ALLHALTED)) {
 				t->state = TARGET_HALTED;
-				if (t->debug_reason == DBG_REASON_NOTHALTED)
+				if (t->debug_reason == DBG_REASON_NOTHALTED) {
 					t->debug_reason = DBG_REASON_DBGRQ;
+				}
 			} else if (get_field(t_dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
 				t->state = TARGET_UNAVAILABLE;
 			}
@@ -6037,8 +6225,9 @@ static int riscv013_halt_go(struct target *target)
 		/* Set state for the current target based on its dmstatus. */
 		if (get_field(dmstatus, DM_DMSTATUS_ALLHALTED)) {
 			target->state = TARGET_HALTED;
-			if (target->debug_reason == DBG_REASON_NOTHALTED)
+			if (target->debug_reason == DBG_REASON_NOTHALTED) {
 				target->debug_reason = DBG_REASON_DBGRQ;
+			}
 		} else if (get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
 			target->state = TARGET_UNAVAILABLE;
 		}
@@ -6223,8 +6412,9 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	LOG_TARGET_DEBUG(target, "resuming (operation=%s)",
 		step ? "single-step" : "resume");
 
-	if (riscv_reg_flush_all(target) != ERROR_OK)
+	if (riscv_reg_flush_all(target) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	riscv_reg_cache_invalidate_all(target);
 
@@ -6234,8 +6424,38 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	dmcontrol = set_dmcontrol_hartsel(dmcontrol, dm->current_hartid);
 	/* `resumereq` should not be issued if `abstractcs.busy` is set. */
 	int result = wait_for_idle_if_needed(target);
-	if (result != ERROR_OK)
+	if (result != ERROR_OK) {
 		return result;
+	}
+	if (riscv_info(target)->reset_halt_retry && !step) {
+		result = dm_write(target, DM_DMCONTROL, dmcontrol);
+		uint32_t base = set_field(dmcontrol, DM_DMCONTROL_RESUMEREQ, 0);
+		if (result != ERROR_OK) {
+			(void)dm_write(target, DM_DMCONTROL, base);
+			return result;
+		}
+		int64_t deadline = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
+		uint32_t dmstatus = 0;
+		bool acknowledged = false;
+		do {
+			if (dmstatus_read(target, &dmstatus, true) == ERROR_OK &&
+					get_field(dmstatus, DM_DMSTATUS_ALLRESUMEACK)) {
+				acknowledged = true;
+				break;
+			}
+			alive_sleep(10);
+		} while (timeval_ms() < deadline);
+		result = dm_write(target, DM_DMCONTROL, base);
+		if (result != ERROR_OK) {
+			return result;
+		}
+		if (acknowledged) {
+			return ERROR_OK;
+		}
+		LOG_TARGET_ERROR(target, "Timed out waiting for resume acknowledgment (dmstatus=0x%08x)",
+				dmstatus);
+		return ERROR_TIMEOUT_REACHED;
+	}
 	dm_write(target, DM_DMCONTROL, dmcontrol);
 
 	dmcontrol = set_field(dmcontrol, DM_DMCONTROL_RESUMEREQ, 0);
@@ -6243,14 +6463,18 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	uint32_t dmstatus;
 	for (size_t i = 0; i < 256; ++i) {
 		usleep(10);
-		if (dmstatus_read(target, &dmstatus, true) != ERROR_OK)
+		if (dmstatus_read(target, &dmstatus, true) != ERROR_OK) {
 			return ERROR_FAIL;
-		if (get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL))
+		}
+		if (get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
 			return ERROR_FAIL;
-		if (get_field(dmstatus, DM_DMSTATUS_ALLRESUMEACK) == 0)
+		}
+		if (get_field(dmstatus, DM_DMSTATUS_ALLRESUMEACK) == 0) {
 			continue;
-		if (step && get_field(dmstatus, DM_DMSTATUS_ALLHALTED) == 0)
+		}
+		if (step && get_field(dmstatus, DM_DMSTATUS_ALLHALTED) == 0) {
 			continue;
+		}
 
 		dm_write(target, DM_DMCONTROL, dmcontrol);
 		return ERROR_OK;
@@ -6263,18 +6487,20 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	LOG_TARGET_ERROR(target,
 		"  cancelling the resume request (dmcontrol.resumereq <- 0)");
 
-	if (dmstatus_read(target, &dmstatus, true) != ERROR_OK)
+	if (dmstatus_read(target, &dmstatus, true) != ERROR_OK) {
 		return ERROR_FAIL;
+	}
 
 	LOG_TARGET_ERROR(target, "  dmstatus after cancellation=0x%08x", dmstatus);
 
 	if (step) {
 		LOG_TARGET_ERROR(target,
 			"  trying to recover from a failed single-step, by requesting halt");
-		if (riscv_halt(target) == ERROR_OK)
+		if (riscv_halt(target) == ERROR_OK) {
 			LOG_TARGET_ERROR(target, "  halt completed after failed single-step");
-		else
+		} else {
 			LOG_TARGET_ERROR(target, "  could not halt, something is wrong with the taget");
+		}
 		// TODO: returning ERROR_OK is questionable, this code needs to be revised
 		return ERROR_OK;
 	}
