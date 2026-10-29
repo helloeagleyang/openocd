@@ -215,6 +215,9 @@ typedef struct {
 	uint32_t sbcs;
 
 	enum yes_no_maybe progbuf_writable;
+	/* Supported optional data-register triggers, probed once while idle. */
+	bool progbuf_autoexec_checked;
+	uint32_t progbuf_autoexec_mask;
 	/* We only need the address so that we know the alignment of the buffer. */
 	riscv_addr_t progbuf_address;
 
@@ -3700,6 +3703,8 @@ enum mem_access_result_type {
 			SKIPPED, "skipped (sysbus access failed)") \
 	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_SKIPPED_REG_SAVE_FAILED, \
 			SKIPPED, "skipped (register save failed)") \
+	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_SKIPPED_PROGBUF_GPR_ABSTRACT_UNSUPPORTED, \
+			SKIPPED, "skipped (Program Buffer GPR abstract access unsupported)") \
 	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_SKIPPED_UNKNOWN_SYSBUS_VERSION, \
 			SKIPPED, "skipped (unknown sysbus version)") \
 	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_SKIPPED_PROGRAM_WRITE_FAILED, \
@@ -3725,6 +3730,8 @@ enum mem_access_result_type {
 			FAILED, "failed (progbuf inner failed)") \
 	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_FAILED_PROGBUF_TEARDOWN_FAILED, \
 			FAILED, "failed (progbuf teardown failed)") \
+	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED, \
+			FAILED, "failed (multiword progbuf teardown failed)") \
 	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_FAILED_EXECUTE_ABSTRACT_FAILED, \
 			FAILED, "failed (execute abstract failed)") \
 	MEM_ACCESS_RESULT_HANDLER(MEM_ACCESS_FAILED_NO_FORWARD_PROGRESS, \
@@ -4599,6 +4606,275 @@ read_memory_progbuf_inner_one(struct target *target, const struct riscv_mem_acce
 	return read_word_from_s1(target, args, 0);
 }
 
+/* Do not reconfigure a stream while its last command is still executing.
+ * Read back zero before callers access GPRs: an armed trigger could otherwise
+ * execute a different command through the same data registers. */
+static int progbuf_multiword_clear_autoexec(struct target *target)
+{
+	if (wait_for_idle_if_needed(target) != ERROR_OK)
+		return ERROR_FAIL;
+	if (dm_write(target, DM_ABSTRACTAUTO, 0) != ERROR_OK)
+		return ERROR_FAIL;
+	uint32_t autoexec;
+	if (dm_read(target, &autoexec, DM_ABSTRACTAUTO) != ERROR_OK || autoexec != 0)
+		return ERROR_FAIL;
+	return ERROR_OK;
+}
+
+/* s0/x8 is the RAM cursor and s1/x9 is the only scratch data register.
+ * Keep accesses to the DM data window in signed-immediate 32-bit form; x0
+ * cannot be a c.lw/c.sw base. RAM accesses can use the compact register set.
+ * For each word, emit c.lw from RAM followed by sw into the data window.
+ *
+ * Pack halfwords explicitly: a 32-bit instruction may cross a Program Buffer
+ * entry boundary. Both entries remain part of one contiguous instruction
+ * stream; instruction_count counts populated entries, not instructions. */
+static int progbuf_compressed_memory_program(struct riscv_program *program,
+		int32_t dataaddr, unsigned int words)
+{
+	uint16_t code[3 * RISCV_PROGBUF_MAX_MEMORY_WORDS + 2];
+	unsigned int used = 0;
+	assert(words >= 2 && words <= RISCV_PROGBUF_MAX_MEMORY_WORDS);
+	for (unsigned int i = 0; i < words; ++i) {
+		/* rd'/rs2' = s1 and rs1' = s0. For offsets 0,4,8,12,
+		 * uimm[5:3] is at [12:10] and uimm[2] is at [6]. */
+		const uint16_t compact = MATCH_C_LW | BIT(2) |
+				((i & 1) << 6) | ((i >> 1) << 10);
+		const uint32_t full = sw(GDB_REGNO_S1, GDB_REGNO_ZERO, dataaddr + 4 * i);
+		code[used++] = compact;
+		code[used++] = full;
+		code[used++] = full >> 16;
+	}
+	/* c.addi s0,4*words: these positive increments fit in imm[4:0]. */
+	code[used++] = MATCH_C_ADDI | (GDB_REGNO_S0 << 7) | ((words * 4) << 2);
+	struct target *target = program->target;
+	RISCV_INFO(r);
+	/* An implicit ebreak terminates only at the physical buffer end. */
+	if (used != 2 * riscv_progbuf_size(program->target) ||
+			!r->get_impebreak(program->target))
+		code[used++] = MATCH_C_EBREAK;
+	if (used % 2 != 0)
+		code[used++] = MATCH_C_NOP; /* Pad the final stored entry. */
+	assert(used <= ARRAY_SIZE(code));
+	for (unsigned int i = 0; i < used; i += 2) {
+		if (riscv_program_insert(program, code[i] | (uint32_t)code[i + 1] << 16) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
+static int progbuf_select_memory_words(struct target *target,
+		const struct riscv_mem_access_args args, unsigned int *words, bool *compressed)
+{
+	RISCV_INFO(r);
+	RISCV013_INFO(info);
+	*words = 1;
+	*compressed = false;
+	/* Amortize data-window setup and program upload over bulk RV32 reads.
+	 * Other access shapes keep the existing implementation. */
+	const bool enabled = riscv_mem_access_is_read(args) && r->progbuf_read_multiword;
+	if (!enabled || args.size != 4 || args.increment != 4 || args.count < 128 ||
+			riscv_xlen(target) != 32 || info->dataaccess != DM_HARTINFO_DATAACCESS_MEMORY ||
+			args.address > UINT32_MAX ||
+			args.address + (uint64_t)args.count * 4 > UINT32_MAX)
+		return ERROR_OK;
+
+	/* HARTINFO gives a signed 12-bit address. Every window word must fit
+	 * in the signed load/store immediate, not just its first address. */
+	const int32_t dataaddr = (info->dataaddr & BIT(11)) ?
+			(info->dataaddr | ~0xfff) : info->dataaddr;
+	if (dataaddr % 4 != 0)
+		return ERROR_OK;
+	const unsigned int data_words = MIN(RISCV_PROGBUF_MAX_MEMORY_WORDS, MIN(info->datacount,
+			MIN(info->datasize, (unsigned int)(2048 - dataaddr) / 4)));
+	/* Two-entry buffers retain the existing single-word implementation. */
+	const bool has_c = info->progbufsize > 2 && riscv_supports_extension(target, 'C');
+	/* Reject unusable layouts before performing optional DMI probing. */
+	const uint32_t requested = (BIT(data_words) - 1) & ~BIT(0);
+	if (riscv_program_memory_words(info->progbufsize, info->impebreak, has_c,
+			data_words, requested, compressed) == 1)
+		return ERROR_OK;
+
+	/* Changing ABSTRACTAUTO does not itself execute the command. Probe only
+	 * triggers for existing data words, without accessing those data words
+	 * while armed; then clear and verify zero before any register access. */
+	if (!info->progbuf_autoexec_checked) {
+		if (wait_for_idle_if_needed(target) != ERROR_OK)
+			return ERROR_FAIL;
+		uint32_t autoexec;
+		if (dm_read(target, &autoexec, DM_ABSTRACTAUTO) != ERROR_OK || autoexec != 0)
+			return ERROR_FAIL;
+		const int write_result = dm_write(target, DM_ABSTRACTAUTO, requested);
+		const int read_result = write_result == ERROR_OK ?
+				dm_read(target, &autoexec, DM_ABSTRACTAUTO) : ERROR_FAIL;
+		const int clear_result = progbuf_multiword_clear_autoexec(target);
+		if (read_result != ERROR_OK || clear_result != ERROR_OK)
+			return ERROR_FAIL;
+		info->progbuf_autoexec_mask = autoexec & requested;
+		info->progbuf_autoexec_checked = true;
+	}
+	*words = riscv_program_memory_words(info->progbufsize, info->impebreak,
+			has_c, data_words, info->progbuf_autoexec_mask, compressed);
+	return ERROR_OK;
+}
+
+static int read_memory_progbuf_multiword_start(struct target *target,
+		target_addr_t address, unsigned int words)
+{
+	uint32_t cmderr;
+	if (dm_write(target, DM_ABSTRACTAUTO, 0) != ERROR_OK ||
+			register_write_abstract(target, GDB_REGNO_S0, address) != ERROR_OK ||
+			riscv013_execute_progbuf(target, &cmderr) != ERROR_OK)
+		return ERROR_FAIL;
+	/* Prime one group before arming the trigger on its last data word. */
+	return dm_write(target, DM_ABSTRACTAUTO, BIT(words - 1));
+}
+
+/* The data window contains one prefetched group. Reading its last register
+ * returns that word and starts loading the next group. A sticky abstract busy
+ * error invalidates the batch, so retry from its first uncommitted address.
+ * Repeated RAM reads are safe; this is why the option must not be used for MMIO. */
+static struct mem_access_result
+read_memory_progbuf_multiword(struct target *target, const struct riscv_mem_access_args args,
+		unsigned int words, bool compressed)
+{
+	RISCV013_INFO(info);
+	const uint32_t groups = args.count / words;
+	struct riscv_program program;
+	int result = ERROR_FAIL;
+	int64_t retry_deadline = 0;
+	const int32_t dataaddr = (info->dataaddr & BIT(11)) ?
+			(info->dataaddr | ~0xfff) : info->dataaddr;
+
+	if (riscv013_reg_save(target, GDB_REGNO_S0) != ERROR_OK ||
+			riscv013_reg_save(target, GDB_REGNO_S1) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_SKIPPED_REG_SAVE_FAILED);
+
+	riscv_program_init(&program, target);
+	if (compressed) {
+		if (progbuf_compressed_memory_program(&program, dataaddr, words) != ERROR_OK)
+			return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+	} else {
+		for (unsigned int i = 0; i < words; ++i) {
+			if (riscv_program_load(&program, GDB_REGNO_S1, GDB_REGNO_S0,
+						4 * i, 4) != ERROR_OK ||
+					riscv_program_store(&program, GDB_REGNO_S1, GDB_REGNO_ZERO,
+						dataaddr + 4 * i, 4) != ERROR_OK)
+				return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+		}
+		if (riscv_program_addi(&program, GDB_REGNO_S0, GDB_REGNO_S0, words * 4) != ERROR_OK ||
+				riscv_program_ebreak(&program) != ERROR_OK)
+			return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+	}
+	if (riscv_program_write(&program) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+	LOG_TARGET_DEBUG(target, "Using %u-word%s Program Buffer read", words,
+			compressed ? " compressed" : "");
+	if (read_memory_progbuf_multiword_start(target, args.address, words) != ERROR_OK)
+		goto cleanup;
+
+	/* Consume all but the last group through autoexec. This ensures every
+	 * triggered execution remains inside the requested address range. */
+	for (uint32_t first = 0; first + 1 < groups;) {
+		struct riscv_batch *batch = riscv_batch_alloc(target, RISCV_BATCH_ALLOC_SIZE);
+		if (!batch)
+			goto cleanup;
+		const uint32_t n = MIN(groups - first - 1,
+				riscv_batch_available_scans(batch) / words);
+		for (uint32_t i = 0; i < n; ++i) {
+			for (unsigned int reg = 0; reg < words; ++reg) {
+				riscv_batch_add_dm_read(batch, DM_DATA0 + reg,
+						reg == words - 1 ? RISCV_DELAY_ABSTRACT_COMMAND : RISCV_DELAY_BASE);
+			}
+		}
+		dm013_info_t *dm = get_dm(target);
+		if (!dm) {
+			riscv_batch_free(batch);
+			goto cleanup;
+		}
+		dm->abstract_cmd_maybe_busy = true;
+		uint32_t abstractcs;
+		if (batch_run_timeout(target, batch) != ERROR_OK ||
+				wait_for_idle(target, &abstractcs) != ERROR_OK) {
+			riscv_batch_free(batch);
+			goto cleanup;
+		}
+		/* batch_run_timeout handles DMI busy without losing scan positions.
+		 * Abstract-command busy is separate: do not accept this batch. */
+		const uint32_t cmderr = get_field32(abstractcs, DM_ABSTRACTCS_CMDERR);
+		if (cmderr == CMDERR_BUSY) {
+			riscv_batch_free(batch);
+			/* Bound lack of progress, rather than the entire transfer. */
+			if (!retry_deadline)
+				retry_deadline = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
+			if (dm_write(target, DM_ABSTRACTAUTO, 0) != ERROR_OK ||
+					riscv013_clear_abstract_error(target) != ERROR_OK ||
+					increase_ac_busy_delay(target) != ERROR_OK ||
+					timeval_ms() >= retry_deadline ||
+					read_memory_progbuf_multiword_start(target,
+						args.address + (target_addr_t)first * words * 4, words) != ERROR_OK)
+				goto cleanup;
+			continue;
+		}
+		if (cmderr != CMDERR_NONE) {
+			riscv_batch_free(batch);
+			goto cleanup;
+		}
+		for (uint32_t i = 0; i < n * words; ++i) {
+			if (riscv_batch_get_dmi_read_op(batch, i) != DMI_STATUS_SUCCESS) {
+				riscv_batch_free(batch);
+				goto cleanup;
+			}
+			buf_set_u32(args.read_buffer + (first * words + i) * 4, 0, 32,
+					riscv_batch_get_dmi_read_data(batch, i));
+			log_memory_access64(args.address + (first * words + i) * 4,
+					riscv_batch_get_dmi_read_data(batch, i), 4, true);
+		}
+		riscv_batch_free(batch);
+		first += n;
+		retry_deadline = 0;
+	}
+
+	/* Drain the final group without starting an unwanted RAM read. Do this
+	 * before GPR accesses or tail handling, which may overwrite DATA0. */
+	if (dm_write(target, DM_ABSTRACTAUTO, 0) != ERROR_OK)
+		goto cleanup;
+	for (uint32_t i = 0; i < words; ++i) {
+		uint32_t value;
+		if (dm_read(target, &value, DM_DATA0 + i) != ERROR_OK)
+			goto cleanup;
+		buf_set_u32(args.read_buffer + ((groups - 1) * words + i) * 4, 0, 32, value);
+		log_memory_access64(args.address + ((groups - 1) * words + i) * 4,
+				value, 4, true);
+	}
+	/* A partial group uses the original one-element helper after draining. */
+	for (uint32_t i = groups * words; i < args.count; ++i) {
+		const struct riscv_mem_access_args one = {
+			.address = args.address + i * 4,
+			.mode = args.mode,
+			.read_buffer = args.read_buffer + i * 4,
+			.size = 4,
+			.count = 1,
+			.increment = 4,
+		};
+		if (!is_mem_access_ok(read_memory_progbuf_inner_one(target, one)))
+			goto cleanup;
+	}
+	result = ERROR_OK;
+cleanup:
+	/* Do not modify abstractauto while the last command may still be busy. */
+	if (progbuf_multiword_clear_autoexec(target) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+	if (result != ERROR_OK && riscv013_clear_abstract_error(target) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+	const uint32_t command = riscv013_access_register_command(target,
+			GDB_REGNO_S0, 32, AC_ACCESS_REGISTER_TRANSFER | AC_ACCESS_REGISTER_WRITE);
+	if (result != ERROR_OK && is_command_unsupported(target, command))
+		return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_GPR_ABSTRACT_UNSUPPORTED);
+	return mem_access_result(result == ERROR_OK ? MEM_ACCESS_OK :
+			MEM_ACCESS_FAILED_PROGBUF_INNER_FAILED);
+}
+
 /**
  * Read the requested memory, silently handling memory access errors.
  */
@@ -4612,7 +4888,14 @@ read_memory_progbuf(struct target *target, const struct riscv_mem_access_args ar
 
 	if (execute_autofence(target) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_SKIPPED_FENCE_EXEC_FAILED);
+	unsigned int words;
+	bool compressed;
+	if (progbuf_select_memory_words(target, args, &words, &compressed) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+	if (words > 1)
+		return read_memory_progbuf_multiword(target, args, words, compressed);
 
+	LOG_TARGET_DEBUG(target, "Using original single-word Program Buffer read");
 	return (args.count == 1) ?
 			read_memory_progbuf_inner_one(target, args) :
 			read_memory_progbuf_inner(target, args);
@@ -4650,6 +4933,12 @@ access_memory_progbuf(struct target *target, const struct riscv_mem_access_args 
 	struct mem_access_result result = is_read ?
 			read_memory_progbuf(target, args) :
 			write_memory_progbuf(target, args);
+
+	/* Privilege restoration can access GPRs through abstract data registers.
+	 * If autoexec could not be disabled, such accesses may execute the RAM
+	 * program again. Return the teardown failure without issuing them. */
+	if (result.value == MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED)
+		return result;
 
 	if (restore_privilege_progbuf(target, mstatus, mstatus_old,
 			mstatush, mstatush_old, dcsr, dcsr_old) != ERROR_OK)

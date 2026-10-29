@@ -6,7 +6,8 @@ if DUMMY
 TESTS += \
 	test-target-create-command.cfg \
 	test-target-configure-cget-command.cfg \
-	test-target-smp-command.cfg
+	test-target-smp-command.cfg \
+	test-riscv-progbuf-multiword.cfg
 endif
 
 EXTRA_DIST = utils.tcl $(TESTS)

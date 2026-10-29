@@ -4529,6 +4529,18 @@ COMMAND_HANDLER(riscv_mem_access)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(riscv_progbuf_read_multiword)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(r);
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (CMD_ARGC == 1)
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], r->progbuf_read_multiword);
+	command_print(CMD, "%s", r->progbuf_read_multiword ? "on" : "off");
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(riscv_set_mem_access)
 {
 	LOG_WARNING("DEPRECATED! use 'mem_access' not 'set_mem_access'");
@@ -5827,6 +5839,13 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.usage = "[method1 [method2 [method3]]]",
 		.help = "Configure which memory access methods shall be used and in which order "
 			"of priority. Method can be one of: 'progbuf', 'sysbus' or 'abstract'."
+	},
+	{
+		.name = "progbuf_read_multiword",
+		.handler = riscv_progbuf_read_multiword,
+		.mode = COMMAND_ANY,
+		.usage = "[on|off]",
+		.help = "Enable adaptive multiword Program Buffer RAM reads. Default: off."
 	},
 	{
 		.name = "expose_csrs",
