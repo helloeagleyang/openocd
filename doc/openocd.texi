@@ -12129,6 +12129,25 @@ memory access methods, and does not change writes.
 Without an argument, report the current setting.
 @end deffn
 
+@deffn {Command} {riscv progbuf_write_multiword} [@option{on}|@option{off}]
+Enable automatic selection of multiword Program Buffer RAM writes for the
+current RISC-V target. The default is @option{off}. When enabled, contiguous
+32-bit RV32 transfers of at least 128 words use the widest supported group,
+up to four words, based on Program Buffer capacity, implicit @code{ebreak},
+the hart-visible data window, data registers and supported autoexecdata bits.
+The C extension is used only when compressed instructions allow a wider group.
+For example, four buffer entries can support compressed two-word transfers;
+eight entries support ordinary three-word or compressed four-word transfers.
+Two-entry buffers retain the existing single-word path and termination handling.
+Insufficient capacity and short transfers retain the original path.
+Multiword writes also require abstract GPR read/write access for recovery.
+If unsupported, the configured memory method fallback is used before writing RAM.
+Busy retries can repeat memory accesses: enable this only for RAM, not MMIO
+with side effects. This option is independent of the adapter and the other
+memory access methods, and does not change reads.
+Without an argument, report the current setting.
+@end deffn
+
 @deffn {Command} {riscv virt2phys_mode} [@option{hw}|@option{sw}|@option{off}]
 Configure how OpenOCD translates virtual addresses to physical:
 @itemize @bullet

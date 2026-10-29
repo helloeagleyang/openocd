@@ -218,6 +218,9 @@ typedef struct {
 	/* Supported optional data-register triggers, probed once while idle. */
 	bool progbuf_autoexec_checked;
 	uint32_t progbuf_autoexec_mask;
+	enum yes_no_maybe progbuf_gpr_abstract;
+	/* Abstract-command delay component indexed by words per write group. */
+	unsigned int progbuf_write_ac_delay[RISCV_PROGBUF_MAX_MEMORY_WORDS + 1];
 	/* We only need the address so that we know the alignment of the buffer. */
 	riscv_addr_t progbuf_address;
 
@@ -454,6 +457,7 @@ static void reset_learned_delays(struct target *target)
 	RISCV013_INFO(info);
 	assert(info);
 	memset(&info->learned_delays, 0, sizeof(info->learned_delays));
+	memset(info->progbuf_write_ac_delay, 0, sizeof(info->progbuf_write_ac_delay));
 }
 
 static void decrement_reset_delays_counter(struct target *target, size_t finished_scans)
@@ -4624,13 +4628,13 @@ static int progbuf_multiword_clear_autoexec(struct target *target)
 /* s0/x8 is the RAM cursor and s1/x9 is the only scratch data register.
  * Keep accesses to the DM data window in signed-immediate 32-bit form; x0
  * cannot be a c.lw/c.sw base. RAM accesses can use the compact register set.
- * For each word, emit c.lw from RAM followed by sw into the data window.
+ * For each word, emit c.lw + sw on reads and lw + c.sw on writes.
  *
  * Pack halfwords explicitly: a 32-bit instruction may cross a Program Buffer
  * entry boundary. Both entries remain part of one contiguous instruction
  * stream; instruction_count counts populated entries, not instructions. */
 static int progbuf_compressed_memory_program(struct riscv_program *program,
-		int32_t dataaddr, unsigned int words)
+		int32_t dataaddr, unsigned int words, bool is_read)
 {
 	uint16_t code[3 * RISCV_PROGBUF_MAX_MEMORY_WORDS + 2];
 	unsigned int used = 0;
@@ -4638,12 +4642,20 @@ static int progbuf_compressed_memory_program(struct riscv_program *program,
 	for (unsigned int i = 0; i < words; ++i) {
 		/* rd'/rs2' = s1 and rs1' = s0. For offsets 0,4,8,12,
 		 * uimm[5:3] is at [12:10] and uimm[2] is at [6]. */
-		const uint16_t compact = MATCH_C_LW | BIT(2) |
+		const uint16_t compact = (is_read ? MATCH_C_LW : MATCH_C_SW) | BIT(2) |
 				((i & 1) << 6) | ((i >> 1) << 10);
-		const uint32_t full = sw(GDB_REGNO_S1, GDB_REGNO_ZERO, dataaddr + 4 * i);
-		code[used++] = compact;
-		code[used++] = full;
-		code[used++] = full >> 16;
+		const uint32_t full = is_read ?
+				sw(GDB_REGNO_S1, GDB_REGNO_ZERO, dataaddr + 4 * i) :
+				lw(GDB_REGNO_S1, GDB_REGNO_ZERO, dataaddr + 4 * i);
+		if (is_read) {
+			code[used++] = compact;
+			code[used++] = full;
+			code[used++] = full >> 16;
+		} else {
+			code[used++] = full;
+			code[used++] = full >> 16;
+			code[used++] = compact;
+		}
 	}
 	/* c.addi s0,4*words: these positive increments fit in imm[4:0]. */
 	code[used++] = MATCH_C_ADDI | (GDB_REGNO_S0 << 7) | ((words * 4) << 2);
@@ -4670,9 +4682,10 @@ static int progbuf_select_memory_words(struct target *target,
 	RISCV013_INFO(info);
 	*words = 1;
 	*compressed = false;
-	/* Amortize data-window setup and program upload over bulk RV32 reads.
-	 * Other access shapes keep the existing implementation. */
-	const bool enabled = riscv_mem_access_is_read(args) && r->progbuf_read_multiword;
+	/* Amortize data-window setup and program upload over bulk RV32 reads
+	 * or writes. Other access shapes keep the existing implementation. */
+	const bool enabled = riscv_mem_access_is_read(args) ?
+			r->progbuf_read_multiword : r->progbuf_write_multiword;
 	if (!enabled || args.size != 4 || args.increment != 4 || args.count < 128 ||
 			riscv_xlen(target) != 32 || info->dataaccess != DM_HARTINFO_DATAACCESS_MEMORY ||
 			args.address > UINT32_MAX ||
@@ -4752,7 +4765,7 @@ read_memory_progbuf_multiword(struct target *target, const struct riscv_mem_acce
 
 	riscv_program_init(&program, target);
 	if (compressed) {
-		if (progbuf_compressed_memory_program(&program, dataaddr, words) != ERROR_OK)
+		if (progbuf_compressed_memory_program(&program, dataaddr, words, true) != ERROR_OK)
 			return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
 	} else {
 		for (unsigned int i = 0; i < words; ++i) {
@@ -5503,12 +5516,277 @@ write_memory_progbuf_inner(struct target *target,
 			mem_access_result(MEM_ACCESS_FAILED_PROGBUF_TEARDOWN_FAILED);
 }
 
+static int progbuf_multiword_write_gpr_available(struct target *target, bool *available)
+{
+	RISCV013_INFO(info);
+	/* Recovery must inspect and restart s0 while the RAM program remains
+	 * loaded. A register-access fallback could overwrite that program, so
+	 * verify both abstract directions before writing any RAM. */
+	if (info->progbuf_gpr_abstract == YNM_MAYBE) {
+		riscv_reg_t s0;
+		const uint32_t read_command = riscv013_access_register_command(target,
+				GDB_REGNO_S0, 32, AC_ACCESS_REGISTER_TRANSFER);
+		const uint32_t write_command = riscv013_access_register_command(target,
+				GDB_REGNO_S0, 32, AC_ACCESS_REGISTER_TRANSFER |
+				AC_ACCESS_REGISTER_WRITE);
+		if (is_command_unsupported(target, read_command) ||
+				is_command_unsupported(target, write_command)) {
+			info->progbuf_gpr_abstract = YNM_NO;
+		} else if (register_read_abstract(target, &s0, GDB_REGNO_S0) != ERROR_OK) {
+			if (!is_command_unsupported(target, read_command))
+				return ERROR_FAIL;
+			info->progbuf_gpr_abstract = YNM_NO;
+		} else if (register_write_abstract(target, GDB_REGNO_S0, s0) != ERROR_OK) {
+			if (!is_command_unsupported(target, write_command))
+				return ERROR_FAIL;
+			info->progbuf_gpr_abstract = YNM_NO;
+		} else {
+			info->progbuf_gpr_abstract = YNM_YES;
+		}
+	}
+	*available = info->progbuf_gpr_abstract == YNM_YES;
+	return ERROR_OK;
+}
+
+static int write_memory_progbuf_multiword_start(struct target *target,
+		const struct riscv_mem_access_args args, uint32_t group, unsigned int words)
+{
+	const target_addr_t address = args.address + (target_addr_t)group * words * 4;
+	/* Setting s0 changes COMMAND and DATA0. Reload the complete payload
+	 * afterwards, then leave a transfer-free postexec command selected. */
+	if (register_write_abstract(target, GDB_REGNO_S0, address) != ERROR_OK)
+		return ERROR_FAIL;
+	for (unsigned int reg = 0; reg < words; ++reg) {
+		const uint32_t value = buf_get_u32(args.write_buffer +
+				((size_t)group * words + reg) * 4, 0, 32);
+		if (dm_write(target, DM_DATA0 + reg, value) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+	uint32_t cmderr;
+	if (riscv013_execute_progbuf(target, &cmderr) != ERROR_OK)
+		return ERROR_FAIL;
+	for (unsigned int reg = 0; reg < words; ++reg) {
+		const uint32_t value = buf_get_u32(args.write_buffer +
+				((size_t)group * words + reg) * 4, 0, 32);
+		log_memory_access64(address + reg * 4, value, 4, false);
+	}
+	return ERROR_OK;
+}
+
+/* Write each data group before triggering its execution through the last
+ * register. s0 advances only after all stores in a group, and is therefore
+ * the progress marker when a sticky abstract busy error stops later triggers. */
+static struct mem_access_result
+write_memory_progbuf_multiword(struct target *target, const struct riscv_mem_access_args args,
+		unsigned int words, bool compressed)
+{
+	RISCV013_INFO(info);
+	unsigned int *write_delay = &info->progbuf_write_ac_delay[words];
+	const uint32_t groups = args.count / words;
+	int64_t retry_deadline = 0;
+	struct riscv_program program;
+	bool delay_overridden = false;
+	bool reset_delays_pending = false;
+	unsigned int saved_ac_delay = 0;
+	int result = ERROR_FAIL;
+
+	if (riscv013_reg_save(target, GDB_REGNO_S0) != ERROR_OK ||
+			riscv013_reg_save(target, GDB_REGNO_S1) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_SKIPPED_REG_SAVE_FAILED);
+
+	uint32_t autoexec;
+	if (dm_read(target, &autoexec, DM_ABSTRACTAUTO) != ERROR_OK || autoexec != 0)
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+
+	const int32_t dataaddr = (info->dataaddr & BIT(11)) ?
+			(info->dataaddr | ~0xfff) : info->dataaddr;
+	riscv_program_init(&program, target);
+	if (compressed) {
+		if (progbuf_compressed_memory_program(&program, dataaddr, words, false) != ERROR_OK)
+			return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+	} else {
+		for (unsigned int i = 0; i < words; ++i) {
+			if (riscv_program_load(&program, GDB_REGNO_S1, GDB_REGNO_ZERO,
+						dataaddr + 4 * i, 4) != ERROR_OK ||
+					riscv_program_store(&program, GDB_REGNO_S1, GDB_REGNO_S0,
+						4 * i, 4) != ERROR_OK)
+				return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+		}
+		if (riscv_program_addi(&program, GDB_REGNO_S0, GDB_REGNO_S0, words * 4) != ERROR_OK ||
+				riscv_program_ebreak(&program) != ERROR_OK)
+			return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+	}
+	if (riscv_program_write(&program) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_FILL_FAILED);
+	LOG_TARGET_DEBUG(target, "Using %u-word%s Program Buffer write", words,
+			compressed ? " compressed" : "");
+	/* Keep per-width write learning out of ordinary abstract accesses. The
+	 * setter accepts the component only; DMI base delay is independent. */
+	saved_ac_delay = info->learned_delays.ac_delay;
+	reset_delays_pending = riscv_info(target)->reset_delays_wait >= 0;
+	if (*write_delay > saved_ac_delay)
+		riscv_scan_set_delay(&info->learned_delays, RISCV_DELAY_ABSTRACT_COMMAND,
+				*write_delay);
+	delay_overridden = true;
+	if (write_memory_progbuf_multiword_start(target, args, 0, words) != ERROR_OK)
+		goto cleanup;
+	if (dm_write(target, DM_ABSTRACTAUTO, BIT(words - 1)) != ERROR_OK)
+		goto cleanup;
+
+	for (uint32_t first = 1; first < groups;) {
+		struct riscv_batch *batch = riscv_batch_alloc(target, RISCV_BATCH_ALLOC_SIZE);
+		if (!batch)
+			goto cleanup;
+		const uint32_t n = MIN(groups - first,
+				riscv_batch_available_scans(batch) / words);
+		for (uint32_t i = 0; i < n; ++i) {
+			for (uint32_t reg = 0; reg < words; ++reg) {
+				const uint32_t value = buf_get_u32(args.write_buffer +
+						((size_t)(first + i) * words + reg) * 4, 0, 32);
+				riscv_batch_add_dm_write(batch, DM_DATA0 + reg, value, true,
+						reg == words - 1 ? RISCV_DELAY_ABSTRACT_COMMAND : RISCV_DELAY_BASE);
+			}
+		}
+		dm013_info_t *dm = get_dm(target);
+		if (!dm) {
+			riscv_batch_free(batch);
+			goto cleanup;
+		}
+		dm->abstract_cmd_maybe_busy = true;
+		uint32_t abstractcs;
+		const int batch_result = batch_run_timeout(target, batch);
+		const int idle_result = batch_result == ERROR_OK ?
+				wait_for_idle(target, &abstractcs) : ERROR_FAIL;
+		riscv_batch_free(batch);
+		if (batch_result != ERROR_OK || idle_result != ERROR_OK)
+			goto cleanup;
+
+		const uint32_t cmderr = get_field32(abstractcs, DM_ABSTRACTCS_CMDERR);
+		if (cmderr == CMDERR_NONE) {
+			retry_deadline = 0;
+			for (uint32_t i = 0; i < n * words; ++i) {
+				const uint32_t value = buf_get_u32(args.write_buffer +
+						((size_t)first * words + i) * 4, 0, 32);
+				log_memory_access64(args.address + ((target_addr_t)first * words + i) * 4,
+						value, 4, false);
+			}
+			first += n;
+			continue;
+		}
+		if (cmderr != CMDERR_BUSY)
+			goto cleanup;
+		if (retry_deadline == 0)
+			retry_deadline = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
+		if (timeval_ms() >= retry_deadline)
+			goto cleanup;
+
+		if (progbuf_multiword_clear_autoexec(target) != ERROR_OK ||
+				riscv013_clear_abstract_error(target) != ERROR_OK ||
+				increase_ac_busy_delay(target) != ERROR_OK)
+			goto cleanup;
+		riscv_reg_t address_on_target;
+		if (register_read_abstract(target, &address_on_target, GDB_REGNO_S0) != ERROR_OK)
+			goto cleanup;
+		const target_addr_t batch_start = args.address + (target_addr_t)first * words * 4;
+		const target_addr_t batch_end = batch_start + (target_addr_t)n * words * 4;
+		/* Validate the progress marker before deriving a host buffer offset. */
+		if (address_on_target < batch_start || address_on_target > batch_end ||
+				(address_on_target - args.address) % (words * 4) != 0) {
+			LOG_TARGET_ERROR(target, "Unexpected Program Buffer write address 0x%08x",
+					(unsigned int)address_on_target);
+			goto cleanup;
+		}
+		first = (address_on_target - args.address) / (words * 4);
+		/* Reading s0 replaced DM_COMMAND. Prime one complete group to
+		 * restore the postexec command before enabling autoexec again. */
+		if (first < groups) {
+			if (write_memory_progbuf_multiword_start(target, args, first, words) != ERROR_OK)
+				goto cleanup;
+			++first;
+			retry_deadline = 0;
+		}
+		if (first < groups && dm_write(target, DM_ABSTRACTAUTO, BIT(words - 1)) != ERROR_OK)
+			goto cleanup;
+	}
+
+	if (progbuf_multiword_clear_autoexec(target) != ERROR_OK)
+		goto cleanup;
+	riscv_reg_t address_on_target;
+	if (register_read_abstract(target, &address_on_target, GDB_REGNO_S0) != ERROR_OK)
+		goto cleanup;
+	const target_addr_t expected_address = args.address + (target_addr_t)groups * words * 4;
+	if (address_on_target != expected_address) {
+		LOG_TARGET_ERROR(target, "Program Buffer write stopped at 0x%08x, expected 0x%08x",
+				(unsigned int)address_on_target, (unsigned int)expected_address);
+		goto cleanup;
+	}
+	/* Restore the ordinary component before using the single-word tail. */
+	if (reset_delays_pending && riscv_info(target)->reset_delays_wait < 0)
+		saved_ac_delay = 0;
+	*write_delay = MAX(*write_delay,
+			info->learned_delays.ac_delay);
+	riscv_scan_set_delay(&info->learned_delays, RISCV_DELAY_ABSTRACT_COMMAND,
+			saved_ac_delay);
+	delay_overridden = false;
+	if (groups * words != args.count) {
+		const struct riscv_mem_access_args tail = {
+			.address = args.address + (target_addr_t)groups * words * 4,
+			.mode = args.mode,
+			.write_buffer = args.write_buffer + (size_t)groups * words * 4,
+			.size = 4,
+			.count = args.count - groups * words,
+			.increment = 4,
+		};
+		if (!is_mem_access_ok(write_memory_progbuf_inner(target, tail)))
+			goto cleanup;
+	}
+	result = ERROR_OK;
+cleanup:
+	/* A diagnostic reset during the stream must not resurrect the saved delay. */
+	if (reset_delays_pending && riscv_info(target)->reset_delays_wait < 0)
+		saved_ac_delay = 0;
+	if (delay_overridden) {
+		*write_delay = MAX(*write_delay,
+				info->learned_delays.ac_delay);
+		riscv_scan_set_delay(&info->learned_delays, RISCV_DELAY_ABSTRACT_COMMAND,
+				saved_ac_delay);
+	}
+	if (progbuf_multiword_clear_autoexec(target) != ERROR_OK) {
+		LOG_TARGET_ERROR(target, "Could not disable Program Buffer autoexec; "
+				"reset the Debug Module before further memory access");
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+	}
+	if (result != ERROR_OK && riscv013_clear_abstract_error(target) != ERROR_OK) {
+		LOG_TARGET_ERROR(target, "Could not clear Program Buffer write error");
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+	}
+	return mem_access_result(result == ERROR_OK ? MEM_ACCESS_OK :
+			MEM_ACCESS_FAILED_PROGBUF_INNER_FAILED);
+}
+
 static struct mem_access_result
 write_memory_progbuf(struct target *target, const struct riscv_mem_access_args args)
 {
 	assert(riscv_mem_access_is_write(args));
 
-	struct mem_access_result result = write_memory_progbuf_inner(target, args);
+	unsigned int words;
+	bool compressed;
+	if (progbuf_select_memory_words(target, args, &words, &compressed) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+	if (words > 1) {
+		bool gpr_available;
+		if (progbuf_multiword_write_gpr_available(target, &gpr_available) != ERROR_OK)
+			return mem_access_result(MEM_ACCESS_FAILED_PROGBUF_MULTIWORD_TEARDOWN_FAILED);
+		if (!gpr_available)
+			return mem_access_result(MEM_ACCESS_SKIPPED_PROGBUF_GPR_ABSTRACT_UNSUPPORTED);
+	}
+	if (words == 1)
+		LOG_TARGET_DEBUG(target, "Using original single-word Program Buffer write");
+	struct mem_access_result result = words > 1 ?
+			write_memory_progbuf_multiword(target, args, words, compressed) :
+			write_memory_progbuf_inner(target, args);
+	if (words > 1 && !is_mem_access_ok(result))
+		return result;
 
 	if (execute_autofence(target) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_FAILED_FENCE_EXEC_FAILED);

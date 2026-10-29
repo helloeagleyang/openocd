@@ -4541,6 +4541,18 @@ COMMAND_HANDLER(riscv_progbuf_read_multiword)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(riscv_progbuf_write_multiword)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(r);
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (CMD_ARGC == 1)
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], r->progbuf_write_multiword);
+	command_print(CMD, "%s", r->progbuf_write_multiword ? "on" : "off");
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(riscv_set_mem_access)
 {
 	LOG_WARNING("DEPRECATED! use 'mem_access' not 'set_mem_access'");
@@ -5846,6 +5858,13 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.usage = "[on|off]",
 		.help = "Enable adaptive multiword Program Buffer RAM reads. Default: off."
+	},
+	{
+		.name = "progbuf_write_multiword",
+		.handler = riscv_progbuf_write_multiword,
+		.mode = COMMAND_ANY,
+		.usage = "[on|off]",
+		.help = "Enable adaptive multiword Program Buffer RAM writes. Default: off."
 	},
 	{
 		.name = "expose_csrs",

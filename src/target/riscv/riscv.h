@@ -346,6 +346,8 @@ struct riscv_info {
 	/* Different memory regions may need different methods but single configuration is applied
 	 * for all. Following flags are used to warn only once about failing memory access method. */
 	bool mem_access_warn[RISCV_MEM_ACCESS_MAX_METHODS_NUM];
+	/* Opt in to adaptive multiword Program Buffer writes. */
+	bool progbuf_write_multiword;
 	/* Opt in to adaptive multiword Program Buffer reads. */
 	bool progbuf_read_multiword;
 
