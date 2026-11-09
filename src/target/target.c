@@ -4537,7 +4537,9 @@ COMMAND_HANDLER(handle_target_read_memory)
 	struct target *target = get_current_target(CMD_CTX);
 
 	const size_t buffersize = 4096;
-	uint8_t *buffer = malloc(buffersize);
+	/* Each value needs up to a space, 0x, and two hex digits per byte. */
+	const size_t text_size = (buffersize / width) * (3 + 2 * width) + 1;
+	uint8_t *buffer = malloc(buffersize + text_size);
 
 	if (!buffer) {
 		LOG_ERROR("Failed to allocate memory");
@@ -4568,7 +4570,9 @@ COMMAND_HANDLER(handle_target_read_memory)
 			return retval;
 		}
 
-		for (size_t i = 0; i < chunk_len ; i++) {
+		char *text = (char *)buffer + buffersize;
+		size_t used = 0;
+		for (size_t i = 0; i < chunk_len; i++) {
 			uint64_t v = 0;
 
 			switch (width) {
@@ -4586,9 +4590,17 @@ COMMAND_HANDLER(handle_target_read_memory)
 				break;
 			}
 
-			command_print_sameline(CMD, "%s0x%" PRIx64, separator, v);
+			int length = snprintf(text + used, text_size - used,
+					"%s0x%" PRIx64, separator, v);
+			if (length < 0 || (size_t)length >= text_size - used) {
+				free(buffer);
+				return ERROR_FAIL;
+			}
+			used += length;
 			separator = " ";
 		}
+		/* Appending each word separately copies the entire result per word. */
+		command_print_sameline(CMD, "%s", text);
 
 		count -= chunk_len;
 		addr += chunk_len * width;

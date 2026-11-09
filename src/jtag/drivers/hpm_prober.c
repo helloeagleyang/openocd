@@ -5,6 +5,7 @@
 #endif
 
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 #include <jtag/adapter.h>
 #include <jtag/interface.h>
@@ -28,6 +29,10 @@ enum hpm_prober_feature {
 #define HPM_RAW_LEGACY_BITS 2048
 #define HPM_RAW_BITS 3584
 #define HPM_RAW_SAMPLES HPM_RAW_LEGACY_BITS
+#define HPM_JTAG_INFO_BYTES 10U
+#define HPM_SEQUENCE_CLOCK_BITMAP_BYTES 16U
+#define HPM_SEQUENCE_CLOCK_MAX_MHZ 100U
+#define HPM_JTAG_CAP_SEQUENCE_FREQUENCIES (1U << 4)
 
 static struct libusb_device_handle *device;
 static unsigned int packet_size;
@@ -479,6 +484,282 @@ static int hpm_tap_reset(void)
 	return ERROR_OK;
 }
 
+/* Encode JTAG queue commands directly into existing sequence records. */
+#define HPM_SEQUENCE_RECORDS 255U
+#define HPM_SEQUENCE_CLOCKS (HPM_SEQUENCE_RECORDS * 64U)
+
+struct hpm_sequence_capture {
+	uint8_t *buffer;
+	unsigned int bit_offset;
+	unsigned int bits;
+};
+
+struct hpm_sequence_packet {
+	uint8_t request[HPM_MAX_PAYLOAD];
+	struct hpm_sequence_capture captures[HPM_SEQUENCE_RECORDS];
+	unsigned int length;
+	unsigned int reply_length;
+	unsigned int clocks;
+	unsigned int records;
+	unsigned int last_offset;
+	unsigned int last_bits;
+};
+
+static struct hpm_sequence_packet sequence_packet;
+static unsigned int sequence_max_clocks = HPM_RAW_LEGACY_BITS;
+static bool sequence_queue_enabled = true;
+
+static void hpm_sequence_reset_packet(void)
+{
+	sequence_packet.request[0] = 7;
+	sequence_packet.request[1] = 0;
+	sequence_packet.length = 2;
+	sequence_packet.reply_length = 2;
+	sequence_packet.clocks = 0;
+	sequence_packet.records = 0;
+	sequence_packet.last_offset = 0;
+	sequence_packet.last_bits = 0;
+}
+
+static int hpm_sequence_flush(void)
+{
+	struct hpm_sequence_packet *packet = &sequence_packet;
+	if (!packet->records)
+		return ERROR_OK;
+	uint8_t response[HPM_MAX_PAYLOAD];
+	unsigned int length = sizeof(response);
+	packet->request[1] = packet->records;
+	if (hpm_prober_exchange(2, packet->request, packet->length, response, &length) != ERROR_OK ||
+			length != packet->reply_length) {
+		raw_failed = true;
+		hpm_sequence_reset_packet();
+		return ERROR_FAIL;
+	}
+	unsigned int offset = 2;
+	for (unsigned int i = 0; i < packet->records; i++) {
+		struct hpm_sequence_capture *capture = &packet->captures[i];
+		if (!capture->buffer)
+			continue;
+		bit_copy(capture->buffer, capture->bit_offset, response + offset, 0, capture->bits);
+		offset += (capture->bits + 7U) / 8U;
+	}
+	hpm_sequence_reset_packet();
+	return ERROR_OK;
+}
+
+/* Append constant-TMS clocks. TDI and TDO bit offsets refer to field data. */
+static int hpm_sequence_append(bool tms, const uint8_t *out, unsigned int out_offset,
+		uint8_t *in, unsigned int in_offset, unsigned int bits)
+{
+	struct hpm_sequence_packet *packet = &sequence_packet;
+	while (bits) {
+		if (packet->clocks == sequence_max_clocks && hpm_sequence_flush() != ERROR_OK)
+			return ERROR_FAIL;
+		unsigned int budget = sequence_max_clocks - packet->clocks;
+		bool merge = !in && packet->records && packet->last_bits < 64U &&
+			(packet->request[packet->last_offset] & 0xc0U) == (tms ? 0x40U : 0U);
+		unsigned int room = merge ? 64U - packet->last_bits : 64U;
+		unsigned int count = MIN(bits, MIN(room, budget));
+		unsigned int old_bits = merge ? packet->last_bits : 0;
+		unsigned int old_bytes = (old_bits + 7U) / 8U;
+		unsigned int new_bytes = (old_bits + count + 7U) / 8U;
+		unsigned int added = (merge ? 0U : 1U) + new_bytes - old_bytes;
+		unsigned int capture_bytes = in ? (count + 7U) / 8U : 0U;
+		if ((!merge && packet->records == HPM_SEQUENCE_RECORDS) ||
+				packet->length + added > max_payload ||
+				packet->reply_length + capture_bytes > max_payload) {
+			if (hpm_sequence_flush() != ERROR_OK)
+				return ERROR_FAIL;
+			continue;
+		}
+		if (!merge) {
+			packet->last_offset = packet->length++;
+			packet->last_bits = 0;
+			packet->captures[packet->records++] = (struct hpm_sequence_capture){
+				.buffer = in, .bit_offset = in_offset, .bits = count,
+			};
+		}
+		memset(packet->request + packet->length, 0, new_bytes - old_bytes);
+		if (out)
+			bit_copy(packet->request + packet->last_offset + 1U, old_bits, out, out_offset, count);
+		packet->length += new_bytes - old_bytes;
+		packet->last_bits += count;
+		packet->request[packet->last_offset] =
+			(packet->last_bits == 64U ? 0U : packet->last_bits) |
+			(tms ? 0x40U : 0U) | (in ? 0x80U : 0U);
+		packet->reply_length += capture_bytes;
+		packet->clocks += count;
+		out_offset += count;
+		in_offset += count;
+		bits -= count;
+	}
+	return ERROR_OK;
+}
+
+static int hpm_sequence_tms(const uint8_t *bits, unsigned int count)
+{
+	/* TMS runs are short in state moves, but an explicit TMS command can be long. */
+	for (unsigned int i = 0; i < count;) {
+		bool tms = (bits[i / 8U] >> (i % 8U)) & 1U;
+		unsigned int start = i++;
+		while (i < count && ((bits[i / 8U] >> (i % 8U)) & 1U) == (unsigned int)tms)
+			i++;
+		if (hpm_sequence_append(tms, NULL, 0, NULL, 0, i - start) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
+static int hpm_sequence_move(enum tap_state state, bool force)
+{
+	if (tap_get_state() == state && !force)
+		return ERROR_OK;
+	uint8_t path = tap_get_tms_path(tap_get_state(), state);
+	int count = tap_get_tms_path_len(tap_get_state(), state);
+	if (count < 0 || count > 8 || hpm_sequence_tms(&path, count) != ERROR_OK)
+		return ERROR_FAIL;
+	tap_set_state(state);
+	return ERROR_OK;
+}
+
+static int hpm_sequence_scan(struct scan_command *scan)
+{
+	unsigned int last = scan->num_fields;
+	while (last && !scan->fields[last - 1U].num_bits)
+		last--;
+	if (!last)
+		return ERROR_OK;
+	if (!tap_is_state_stable(scan->end_state))
+		return ERROR_FAIL;
+	enum tap_state shift = scan->ir_scan ? TAP_IRSHIFT : TAP_DRSHIFT;
+	if (hpm_sequence_move(shift, false) != ERROR_OK)
+		return ERROR_FAIL;
+	tap_set_end_state(scan->end_state);
+	for (unsigned int i = 0; i < last; i++) {
+		struct scan_field *field = &scan->fields[i];
+		unsigned int bits = field->num_bits;
+		if (!bits)
+			continue;
+		bool final = i == last - 1U && scan->end_state != shift;
+		unsigned int low = bits - (final ? 1U : 0U);
+		if (low && hpm_sequence_append(false, field->out_value, 0,
+				field->in_value, 0, low) != ERROR_OK)
+			return ERROR_FAIL;
+		if (final) {
+			if (hpm_sequence_append(true, field->out_value, low,
+					field->in_value, low, 1U) != ERROR_OK)
+				return ERROR_FAIL;
+			/* The first path bit was the scan's final clock. OpenOCD's
+			 * path table takes stable states, so derive the remainder
+			 * from SHIFT rather than querying the EXIT1 state. */
+			uint8_t path = tap_get_tms_path(shift, scan->end_state);
+			int count = tap_get_tms_path_len(shift, scan->end_state);
+			if (count < 1 || count > 8 || !(path & 1U))
+				return ERROR_FAIL;
+			path >>= 1U;
+			if (hpm_sequence_tms(&path, count - 1U) != ERROR_OK)
+				return ERROR_FAIL;
+			tap_set_state(scan->end_state);
+		}
+	}
+	return ERROR_OK;
+}
+
+static int hpm_sequence_queue(struct jtag_command *queue)
+{
+	if (raw_failed)
+		return ERROR_JTAG_QUEUE_FAILED;
+	hpm_sequence_reset_packet();
+	for (struct jtag_command *cmd = queue; cmd; cmd = cmd->next) {
+		int result = ERROR_OK;
+		switch (cmd->type) {
+		case JTAG_SCAN:
+			result = hpm_sequence_scan(cmd->cmd.scan);
+			break;
+		case JTAG_RUNTEST:
+			if (!tap_is_state_stable(cmd->cmd.runtest->end_state)) {
+				result = ERROR_FAIL;
+				break;
+			}
+			result = hpm_sequence_move(TAP_IDLE, false);
+			if (result == ERROR_OK)
+				result = hpm_sequence_append(false, NULL, 0, NULL, 0,
+					cmd->cmd.runtest->num_cycles);
+			tap_set_end_state(cmd->cmd.runtest->end_state);
+			if (result == ERROR_OK)
+				result = hpm_sequence_move(cmd->cmd.runtest->end_state, false);
+			break;
+		case JTAG_TLR_RESET: {
+			enum tap_state end_state = cmd->cmd.statemove->end_state;
+			if (!tap_is_state_stable(end_state)) {
+				result = ERROR_FAIL;
+				break;
+			}
+			if (transport_type == 2) {
+				result = hpm_sequence_flush();
+				if (result == ERROR_OK)
+					result = hpm_tap_reset();
+				if (result != ERROR_OK)
+					break;
+				/* OScan1 reset and activation leave the physical TAP in Idle.
+				 * Driving it into Test-Logic-Reset again drops the link. */
+				tap_set_state(TAP_IDLE);
+				if (end_state == TAP_RESET)
+					end_state = TAP_IDLE;
+			}
+			tap_set_end_state(end_state);
+			result = hpm_sequence_move(end_state, transport_type != 2);
+			break;
+		}
+		case JTAG_PATHMOVE:
+			for (unsigned int i = 0; i < cmd->cmd.pathmove->num_states; i++) {
+				enum tap_state next = cmd->cmd.pathmove->path[i];
+				bool tms;
+				if (tap_state_transition(tap_get_state(), false) == next)
+					tms = false;
+				else if (tap_state_transition(tap_get_state(), true) == next)
+					tms = true;
+				else {
+					result = ERROR_FAIL;
+					break;
+				}
+				result = hpm_sequence_append(tms, NULL, 0, NULL, 0, 1);
+				if (result != ERROR_OK)
+					break;
+				tap_set_state(next);
+			}
+			if (result == ERROR_OK && !tap_is_state_stable(tap_get_state()))
+				result = ERROR_FAIL;
+			if (result == ERROR_OK)
+				tap_set_end_state(tap_get_state());
+			break;
+		case JTAG_STABLECLOCKS:
+			result = hpm_sequence_append(tap_get_state() == TAP_RESET,
+				NULL, 0, NULL, 0, cmd->cmd.stableclocks->num_cycles);
+			break;
+		case JTAG_TMS:
+			result = hpm_sequence_tms(cmd->cmd.tms->bits, cmd->cmd.tms->num_bits);
+			break;
+		case JTAG_SLEEP:
+			result = hpm_sequence_flush();
+			if (result == ERROR_OK)
+				jtag_sleep(cmd->cmd.sleep->us);
+			break;
+		case JTAG_RESET:
+			break; /* Physical pin assertions are rejected before execution. */
+		default:
+			result = ERROR_FAIL;
+			break;
+		}
+		if (result != ERROR_OK) {
+			raw_failed = true;
+			hpm_sequence_reset_packet();
+			return ERROR_JTAG_QUEUE_FAILED;
+		}
+	}
+	return hpm_sequence_flush() == ERROR_OK ? ERROR_OK : ERROR_JTAG_QUEUE_FAILED;
+}
+
 static int hpm_execute_queue(struct jtag_command *queue)
 {
 	if (raw_mode) {
@@ -490,6 +771,8 @@ static int hpm_execute_queue(struct jtag_command *queue)
 				}
 			}
 		}
+		if (raw_sequence_supported && sequence_queue_enabled)
+			return hpm_sequence_queue(queue);
 		for (struct jtag_command *cmd = queue; cmd;) {
 			if (cmd->type == JTAG_RESET) {
 				cmd = cmd->next;
@@ -499,10 +782,14 @@ static int hpm_execute_queue(struct jtag_command *queue)
 				if (hpm_raw_flush() != ERROR_OK || hpm_tap_reset() != ERROR_OK) {
 					return ERROR_JTAG_QUEUE_FAILED;
 				}
-				/* Re-entry leaves Idle. Execute the queued TLR below as well,
-				 * so physical clocks reach its requested end state. */
+				/* The reset has already completed and OScan1 is online. */
 				tap_set_state(TAP_IDLE);
 				tap_set_end_state(TAP_IDLE);
+				enum tap_state end_state = cmd->cmd.statemove->end_state;
+				if (end_state == TAP_RESET || end_state == TAP_IDLE) {
+					cmd = cmd->next;
+					continue;
+				}
 			}
 			struct jtag_command *last = cmd;
 			while (last->next && last->next->type != JTAG_RESET &&
@@ -578,6 +865,45 @@ static int hpm_speed_div(int speed, int *khz)
 	*khz = actual_khz;
 	return ERROR_OK;
 }
+static void hpm_log_sequence_clocks(const char *transport, const uint8_t *bitmap)
+{
+	/* Each setting can take up to five characters, including its separator. */
+	char rates[sizeof("<1") + HPM_SEQUENCE_CLOCK_MAX_MHZ * 5U] = "";
+	size_t used = 0;
+	if (buf_get_u32(bitmap, 0, 1)) {
+		memcpy(rates, "<1", sizeof("<1"));
+		used = sizeof("<1") - 1;
+	}
+	for (unsigned int mhz = 1; mhz <= HPM_SEQUENCE_CLOCK_MAX_MHZ; mhz++) {
+		if (!buf_get_u32(bitmap, mhz, 1))
+			continue;
+		int length = snprintf(rates + used, sizeof(rates) - used,
+				"%s%u", used ? ", " : "", mhz);
+		if (length < 0 || (size_t)length >= sizeof(rates) - used)
+			return;
+		used += length;
+	}
+	if (used)
+		LOG_INFO("hpm_probex: supported %s sequence clocks (MHz) %s", transport, rates);
+	else
+		LOG_INFO("hpm_probex: %s sequence clocks unavailable", transport);
+}
+
+static void hpm_query_sequence_clocks(const uint8_t *legacy_info)
+{
+	const uint8_t request[] = { 1, 1 };
+	uint8_t info[HPM_JTAG_INFO_BYTES + 2U * HPM_SEQUENCE_CLOCK_BITMAP_BYTES];
+	unsigned int size = sizeof(info);
+	if (hpm_prober_exchange(2, request, sizeof(request), info, &size) != ERROR_OK ||
+			size != sizeof(info) || memcmp(info, legacy_info, HPM_JTAG_INFO_BYTES) != 0) {
+		LOG_WARNING("hpm_probex: could not read the advertised sequence clock settings");
+		return;
+	}
+	hpm_log_sequence_clocks("JTAG", info + HPM_JTAG_INFO_BYTES);
+	hpm_log_sequence_clocks("cJTAG TCKC",
+			info + HPM_JTAG_INFO_BYTES + HPM_SEQUENCE_CLOCK_BITMAP_BYTES);
+}
+
 static int hpm_init(void)
 {
 	bitbang_interface = raw_mode ? &hpm_raw_bitbang : NULL;
@@ -589,6 +915,7 @@ static int hpm_init(void)
 	raw_failed = false;
 	raw_sequence_supported = false;
 	raw_max_bits = HPM_RAW_LEGACY_BITS;
+	sequence_max_clocks = HPM_RAW_LEGACY_BITS;
 	static const uint16_t vids[] = { 0x34b7, 0x34b7, 0 };
 	static const uint16_t pids[] = { 0x8003, 0xe001, 0 };
 	failure = 0;
@@ -636,14 +963,17 @@ static int hpm_init(void)
 		bool raw_cjtag_supported = false;
 		n = sizeof(info);
 		if (hpm_prober_exchange(2, &req, 1, info, &n) == ERROR_OK &&
-				n >= 10 && info[2] == 1) {
+				n >= HPM_JTAG_INFO_BYTES && info[2] == 1) {
 			unsigned int max_cycles = buf_get_u32(info + 4, 0, 16);
 			uint32_t features = buf_get_u32(info + 6, 0, 32);
 			raw_cjtag_supported = features & (1U << 3);
 			if (max_cycles) {
 				raw_max_bits = MIN(max_cycles, HPM_RAW_BITS);
+				sequence_max_clocks = MIN(max_cycles, HPM_SEQUENCE_CLOCKS);
 			}
 			raw_sequence_supported = features & (1U << 2);
+			if (features & HPM_JTAG_CAP_SEQUENCE_FREQUENCIES)
+				hpm_query_sequence_clocks(info);
 		}
 		if (transport_type == 2 && !raw_cjtag_supported) {
 			LOG_ERROR("hpm_probex: firmware does not support raw cJTAG cycles");
@@ -654,6 +984,8 @@ static int hpm_init(void)
 		}
 		LOG_INFO("hpm_probex: raw JTAG %s", raw_sequence_supported ?
 			"sequences" : "packed cycles");
+		if (raw_sequence_supported && sequence_queue_enabled)
+			LOG_INFO("hpm_probex: native sequence queue enabled");
 	}
 	return ERROR_OK;
 release:
@@ -753,7 +1085,18 @@ COMMAND_HANDLER(hpm_dmi_batch_command)
 	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], dmi_batch_enabled);
 	return ERROR_OK;
 }
+COMMAND_HANDLER(hpm_sequence_queue_command)
+{
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (CMD_ARGC == 1)
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], sequence_queue_enabled);
+	command_print(CMD, "sequence_queue: %s", sequence_queue_enabled ? "on" : "off");
+	return ERROR_OK;
+}
 static const struct command_registration hpm_subcommands[] = {
+	{ .name = "sequence_queue", .handler = hpm_sequence_queue_command, .mode = COMMAND_ANY,
+	  .help = "Use native JTAG queue encoding when sequence packets are supported", .usage = "[on|off]" },
 	{ .name = "feature", .handler = hpm_feature_command, .mode = COMMAND_ANY,
 	  .help = "Query or enable probe-side memory offloads", .usage = "[sba|progbuf|abstract [on|off]]" },
 	{ .name = "transport", .handler = hpm_transport_command, .mode = COMMAND_CONFIG,

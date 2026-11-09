@@ -12,6 +12,10 @@ TESTS += \
 	test-hpm-reset-halt-fallback.cfg
 endif
 
+if HPM_PROBER
+TESTS += test-hpm-prober-sequence-queue.cfg
+endif
+
 EXTRA_DIST = utils.tcl $(TESTS)
 
 TEST_EXTENSIONS = .cfg

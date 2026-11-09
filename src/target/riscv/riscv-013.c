@@ -3664,7 +3664,17 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 			batch_reads = batch_reads && (enabled & ADAPTER_CAP_RISCV_DMI_READ_BATCH) != 0;
 		}
 	}
-	const unsigned int batch_limit = batch_reads && increment == size ? 32U : 1U;
+	unsigned int batch_limit = 1;
+	if (batch_reads && increment == size) {
+		batch_limit = 32;
+		if (size == 4 && bscan_tunnel_ir_width == 0 &&
+				riscv_get_dmi_address_bits(target) == 7 &&
+				strcmp(adapter_driver->name, "hpm_probex") == 0) {
+			/* A Probe X sequence packet fits 42 six-record DR41 scans,
+			 * including the final NOP that retrieves the last read. */
+			batch_limit = 41;
+		}
+	}
 	while (next_address < end_address) {
 		uint32_t sbcs_write = set_field(0, DM_SBCS_SBREADONADDR, 1);
 		sbcs_write |= sb_sbaccess(size);

@@ -2670,20 +2670,33 @@ Select the OpenOCD access path before @command{init}. The default is
 over the probe's raw JTAG tunnel, even when high-level firmware features are
 advertised and enabled. With cJTAG selected, the firmware translates these
 logical scans to two-wire OScan1 transfers when the firmware advertises raw
-cJTAG support. OpenOCD uses DAPLink-style JTAG sequences when the firmware
+cJTAG support. A cJTAG TAP reset re-enters OScan1 and leaves the physical
+TAP in Run-Test/Idle. OpenOCD uses DAPLink-style JTAG sequences when the firmware
 advertises them, and falls back to the older packed-cycle
-command otherwise. Raw mode buffers readback for scans queued together, so
+command otherwise. During raw-mode initialization, OpenOCD prints the supported
+JTAG and cJTAG (TCKC) sequence clock settings when the firmware advertises the
+frequency query. Raw mode buffers readback for scans queued together, so
 several scans can share a USB exchange. For SBA v1 memory reads, this adapter
-also advertises queued DMI readback, allowing OpenOCD to batch up to 32 data
-words per JTAG queue when @command{hpm_probex dmi_batch on} is selected and
-the target DM accepts the required SBA streaming settings. This option
+also advertises queued DMI readback when @command{hpm_probex dmi_batch on}
+is selected and the target DM accepts the required SBA streaming settings. This option
 defaults to @option{off}. The probe does not control physical TRST/SRST pins in
 either mode.
 @end deffn
 
+@deffn {Command} {hpm_probex sequence_queue} [on|off]
+Enable or disable direct JTAG queue encoding into the probe's sequence packets.
+The default is @option{on}. This affects raw mode only and is used when the
+probe advertises sequence packet support. The @option{off} setting retains the
+bitbang queue implementation; probes without sequence support use the existing
+packed-cycle fallback regardless of this setting. With no argument, display the
+current setting. This command can be used after initialization.
+@end deffn
+
 @deffn {Command} {hpm_probex dmi_batch} on|off
-Allow OpenOCD to group up to 32 SBA v1 read words into each raw JTAG DMI
-queue. The default is @option{off}. The optimized path is used only when
+Allow OpenOCD to group SBA v1 reads into each raw JTAG DMI queue. Probe X
+batches up to 41 words for 32-bit incrementing accesses with 41-bit DMI
+scans, and up to 32 words for other eligible accesses.
+The default is @option{off}. The optimized path is used only when
 the target DM accepts @code{sbreadonaddr}, @code{sbreadondata}, and (for
 incrementing reads) @code{sbautoincrement}. Unsupported streaming settings
 use individual address-triggered reads.
